@@ -1,0 +1,64 @@
+[package]
+name = "chmlfrp-toolbox-daemon"
+version = "0.1.0"
+edition = "2021"
+description = "ChmlFrp 社区工具箱 Daemon - 服务器端远程管理守护进程"
+license = "MIT"
+authors = ["zhengddzz"]
+
+[[bin]]
+name = "chmlfrp-toolbox-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# HTTP 客户端（测速用）
+reqwest = { version = "0.12", features = ["stream", "json"] }
+futures-util = "0.3"
+# WebSocket
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+# SQLite 数据库
+rusqlite = { version = "0.31", features = ["bundled"] }
+# CLI 参数解析
+clap = { version = "4", features = ["derive"] }
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# UUID 生成
+uuid = { version = "1", features = ["v4"] }
+# 系统信息
+sysinfo = "0.30"
+# 正则表达式（ping 输出解析）
+regex = "1"
+# 原子操作
+once_cell = "1"
+# 错误处理
+anyhow = "1"
+# URL 编码
+urlencoding = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1
+
+# ===== DEB 打包配置 =====
+[package.metadata.deb]
+maintainer = "zhengddzz <zhengddzz@github.com>"
+copyright = "2026, zhengddzz"
+license-file = ["LICENSE", "0"]
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/chmlfrp-toolbox-daemon", "usr/bin/", "755"],
+    ["deploy/chmlfrp-toolbox-daemon.service", "etc/systemd/system/", "644"],
+    ["deploy/config-template.toml", "etc/chmlfrp-toolbox-daemon/config.toml.example", "640"],
+]
+systemd-units = { unit-name = "chmlfrp-toolbox-daemon", enable = false, start = false }

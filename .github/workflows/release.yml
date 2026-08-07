@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+            deb_suffix: amd64
+          - platform: ubuntu-22.04-arm
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+            deb_suffix: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build deb package
+        run: cargo deb --target ${{ matrix.target }} --output chmlfrp-toolbox-daemon_${{ matrix.deb_suffix }}.deb
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: chmlfrp-toolbox-daemon_${{ matrix.deb_suffix }}.deb
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          cp artifacts/deb-amd64/*.deb release/
+          cp artifacts/deb-arm64/*.deb release/
+          cp deploy/install.sh release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
+          body: |
+            ## 安装方式
+
+            ### 一键安装（推荐）
+
+            ```bash
+            # 下载 install.sh 后执行
+            sudo bash install.sh
+            ```
+
+            ### 手动安装（deb 包）
+
+            #### Linux (x64)
+            ```bash
+            sudo dpkg -i chmlfrp-toolbox-daemon_amd64.deb
+            sudo apt-get install -f  # 修复依赖
+            ```
+
+            #### Linux (ARM64)
+            ```bash
+            sudo dpkg -i chmlfrp-toolbox-daemon_arm64.deb
+            sudo apt-get install -f  # 修复依赖
+            ```
+
+            ### 安装后配置
+
+            1. 编辑配置文件：`sudo nano /etc/chmlfrp-toolbox-daemon/config.toml`
+            2. 填入你的 `proxyToken`
+            3. 启动服务：`sudo systemctl start chmlfrp-toolbox-daemon`
+            4. 查看日志：`sudo journalctl -u chmlfrp-toolbox-daemon -f`
+
+            ## 系统要求
+
+            - Linux x64 或 ARM64 (aarch64)
+            - Ubuntu 22.04+ / Debian 12+ / Raspberry Pi OS (Bookworm) / Armbian
+            - 不支持 32 位 ARM (armv7) 设备
+          files: |
+            release/*.deb
+            release/install.sh
+          draft: false
+          prerelease: false

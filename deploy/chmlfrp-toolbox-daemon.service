@@ -1,0 +1,28 @@
+[Unit]
+Description=ChmlFrp Community Toolbox Daemon
+Description[zh_CN]=ChmlFrp 社区工具箱 Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chmlfrp-daemon
+Group=chmlfrp-daemon
+ExecStart=/usr/bin/chmlfrp-toolbox-daemon --config /etc/chmlfrp-toolbox-daemon/config.toml start
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# 安全限制
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/chmlfrp-toolbox-daemon
+PrivateTmp=true
+
+# 环境变量（日志级别）
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
