@@ -44,7 +44,7 @@ CONFIG_FILE="${CONFIG_DIR}/config.toml"
 DATA_DIR="/var/lib/chmlfrp-toolbox-daemon"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 GITHUB_REPO="zhengddzz/chmlfrp-toolbox-daemon"
-GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+UPDATE_API="https://u.zdzz.top/api/toolbox-daemon"
 DEFAULT_BACKEND_URL="wss://api.cct.zdzz.top"
 
 # ===== 输出函数（输出到 stderr，避免干扰函数返回值）=====
@@ -230,37 +230,79 @@ download_file() {
     fi
 }
 
-download_from_github() {
+# 从更新 API 的 JSON 中提取 linux 平台指定 arch 和 format 的下载 URL
+# 优先使用 jq，其次 python3，最后 python2
+get_package_url() {
+    local json=$1
+    local arch=$2
+    local fmt=$3
+
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r ".platforms.linux[] | select(.arch==\"$arch\" and .format==\"$fmt\") | .url" 2>/dev/null | head -1
+    elif command -v python3 &>/dev/null; then
+        echo "$json" | python3 -c "
+import json,sys
+try:
+    data=json.load(sys.stdin)
+    for p in data.get('platforms',{}).get('linux',[]):
+        if p.get('arch')=='$arch' and p.get('format')=='$fmt':
+            print(p['url']); break
+except: pass
+" 2>/dev/null
+    elif command -v python &>/dev/null; then
+        echo "$json" | python -c "
+import json,sys
+try:
+    data=json.load(sys.stdin)
+    for p in data.get('platforms',{}).get('linux',[]):
+        if p.get('arch')=='$arch' and p.get('format')=='$fmt':
+            print(p['url']); break
+except: pass
+" 2>/dev/null
+    else
+        error "需要 jq 或 python 来解析版本信息，请安装后重试"
+    fi
+}
+
+# 获取最新版本号
+get_latest_version() {
+    local json=$1
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r '.version' 2>/dev/null
+    elif command -v python3 &>/dev/null; then
+        echo "$json" | python3 -c "import json,sys; print(json.load(sys.stdin).get('version',''))" 2>/dev/null
+    elif command -v python &>/dev/null; then
+        echo "$json" | python -c "import json,sys; print(json.load(sys.stdin).get('version',''))" 2>/dev/null
+    fi
+}
+
+download_package() {
     local arch=$1
     local pkg_type=$2  # deb | rpm
-    local tmp_dir
-    tmp_dir=$(mktemp -d)
-    trap "rm -rf $tmp_dir" EXIT
 
     info "正在获取最新版本信息..."
-    local release_info
-    release_info=$(download_file "$GITHUB_API" "-" 2>/dev/null || echo "")
+    local api_data
+    api_data=$(download_file "$UPDATE_API" "-" 2>/dev/null || echo "")
 
-    if [[ -z "$release_info" ]]; then
-        error "无法获取 Release 信息，请检查网络连接或稍后重试（GitHub API 可能有访问限制）"
+    if [[ -z "$api_data" ]]; then
+        error "无法获取版本信息，请检查网络连接"
     fi
 
-    local pkg_pattern
-    case "${pkg_type}_${arch}" in
-        deb_x64)   pkg_pattern="_amd64.deb" ;;
-        deb_arm64) pkg_pattern="_arm64.deb" ;;
-        rpm_x64)   pkg_pattern="_x64.rpm" ;;
-        rpm_arm64) pkg_pattern="_arm64.rpm" ;;
-    esac
+    local version
+    version=$(get_latest_version "$api_data")
+    if [[ -n "$version" ]]; then
+        info "最新版本: v$version"
+    fi
 
     local download_url
-    download_url=$(echo "$release_info" | grep -o "https://[^\"]*${pkg_pattern}" | head -1)
+    download_url=$(get_package_url "$api_data" "$arch" "$pkg_type")
 
     if [[ -z "$download_url" ]]; then
         error "未找到架构 ${arch} 的 ${pkg_type} 安装包"
     fi
 
-    local pkg_file="${tmp_dir}/${APP_NAME}.${pkg_type}"
+    # 下载到 /tmp 固定路径（避免子shell trap 删除临时目录导致文件丢失）
+    local pkg_file="/tmp/${APP_NAME}_install.${pkg_type}"
     info "正在下载: $download_url"
     download_file "$download_url" "$pkg_file" || error "下载 ${pkg_type} 包失败"
     echo "$pkg_file"
@@ -569,6 +611,9 @@ main() {
 
     check_root
 
+    # 脚本退出时清理临时下载文件
+    trap "rm -f /tmp/${APP_NAME}_install.deb /tmp/${APP_NAME}_install.rpm" EXIT
+
     # 卸载模式
     if $do_uninstall; then
         uninstall
@@ -602,12 +647,12 @@ main() {
         case "$pkg_manager" in
             apt)
                 local deb_file
-                deb_file=$(download_from_github "$arch" "deb")
+                deb_file=$(download_package "$arch" "deb")
                 install_deb "$deb_file"
                 ;;
             yum|dnf)
                 local rpm_file
-                rpm_file=$(download_from_github "$arch" "rpm")
+                rpm_file=$(download_package "$arch" "rpm")
                 install_rpm "$rpm_file"
                 ;;
             *)
