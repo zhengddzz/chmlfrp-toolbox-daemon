@@ -598,27 +598,8 @@ guided_config() {
 
     echo "欢迎使用 ChmlFrp 社区工具箱 Daemon！"
     echo ""
-    echo "接下来将引导你完成配置。你需要准备："
-    echo "  1. 你的 proxyToken（从桌面客户端登录后获取）"
-    echo "  2. 为这台服务器起一个名字（便于在设备列表中识别）"
-    echo ""
-
-    read -p "按 Enter 继续..." -r < /dev/tty
-
-    # 配置后端地址
-    title "后端地址"
-    local current_url
-    current_url=$(config_get_backend_url)
-    echo "当前后端地址: $current_url"
-    read -p "是否修改？（直接 Enter 保持默认）: " -r new_url < /dev/tty
-    if [[ -n "$new_url" ]]; then
-        config_set_backend_url "$new_url"
-        success "后端地址已更新: $new_url"
-    fi
 
     # 配置账号
-    title "账号配置"
-
     local count
     count=$(config_count_accounts)
     if [[ "$count" -gt 0 ]] && config_is_configured; then
@@ -637,7 +618,6 @@ guided_config() {
     # 完成配置
     title "配置完成"
     echo "当前配置摘要："
-    echo "  后端地址: $(config_get_backend_url)"
     echo "  账号数量: $(config_count_accounts)"
     echo ""
 
