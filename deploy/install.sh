@@ -570,14 +570,14 @@ guided_config() {
     echo "  2. 为这台服务器起一个名字（便于在设备列表中识别）"
     echo ""
 
-    read -p "按 Enter 继续..." -r
+    read -p "按 Enter 继续..." -r < /dev/tty
 
     # 配置后端地址
     title "后端地址"
     local current_url
     current_url=$(config_get_backend_url)
     echo "当前后端地址: $current_url"
-    read -p "是否修改？（直接 Enter 保持默认）: " -r new_url
+    read -p "是否修改？（直接 Enter 保持默认）: " -r new_url < /dev/tty
     if [[ -n "$new_url" ]]; then
         config_set_backend_url "$new_url"
         success "后端地址已更新: $new_url"
@@ -591,7 +591,7 @@ guided_config() {
     if [[ "$count" -gt 0 ]] && config_is_configured; then
         echo "已检测到 $count 个已配置账号"
         echo ""
-        read -p "是否添加新账号？[y/N] " -r
+        read -p "是否添加新账号？[y/N] " -r < /dev/tty
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             add_account_interactive
         fi
@@ -608,7 +608,7 @@ guided_config() {
     echo "  账号数量: $(config_count_accounts)"
     echo ""
 
-    read -p "是否立即启动服务？[Y/n] " -r
+    read -p "是否立即启动服务？[Y/n] " -r < /dev/tty
     if [[ ! $REPLY =~ ^[Nn]$ ]]; then
         service_start
     fi
@@ -621,14 +621,14 @@ add_account_interactive() {
     echo "请输入 proxyToken（从桌面客户端获取）："
     echo "  获取方式：打开桌面客户端 → 设置 → 查看登录信息 → proxyToken"
     echo ""
-    read -p "proxyToken: " -r token
+    read -p "proxyToken: " -r token < /dev/tty
     if [[ -z "$token" ]]; then
         warn "proxyToken 不能为空，已取消"
         return 1
     fi
     local default_name
     default_name=$(hostname 2>/dev/null || echo "服务器")
-    read -p "设备名称 [${default_name}]: " -r name
+    read -p "设备名称 [${default_name}]: " -r name < /dev/tty
     name="${name:-$default_name}"
     config_add_account "$token" "$name"
     success "账号已添加: $name"
@@ -657,7 +657,7 @@ uninstall() {
     systemctl daemon-reload
 
     if [[ -d "$DATA_DIR" ]]; then
-        read -p "是否删除数据目录 $DATA_DIR？[y/N] " -r
+        read -p "是否删除数据目录 $DATA_DIR？[y/N] " -r < /dev/tty
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             rm -rf "$DATA_DIR"
             success "数据目录已删除"
@@ -705,11 +705,6 @@ main() {
     done
 
     check_root
-
-    # curl | bash 管道方式下 stdin 被占用，重新绑定到 /dev/tty 以支持交互输入
-    if [[ ! -t 0 ]] && [[ -t /dev/tty ]]; then
-        exec 0</dev/tty
-    fi
 
     # 脚本退出时清理临时下载文件
     trap "rm -f /tmp/${APP_NAME}_install.deb /tmp/${APP_NAME}_install.rpm" EXIT
