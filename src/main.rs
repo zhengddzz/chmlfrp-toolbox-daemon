@@ -64,7 +64,8 @@ async fn main() -> anyhow::Result<()> {
             db::init_db_dir(&cfg.server.data_dir)?;
 
             // 启动 relay 客户端（多租户，每个 token 一个连接）
-            relay::run_multi_tenant(cfg).await?;
+            let config_path = cli.config.to_string_lossy().to_string();
+            relay::run_multi_tenant(cfg, config_path).await?;
         }
         Command::Status => {
             let cfg = config::load_config(&cli.config)?;

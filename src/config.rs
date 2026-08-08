@@ -6,6 +6,9 @@
 //! backend_url = "wss://api.cct.zdzz.top"
 //! data_dir = "/var/lib/chmlfrp-toolbox-daemon"
 //!
+//! [update]
+//! auto_update = false
+//!
 //! [[accounts]]
 //! proxy_token = "xxx"
 //! device_name = "西安服务器"
@@ -13,12 +16,14 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
+    #[serde(default)]
+    pub update: UpdateConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
@@ -32,6 +37,20 @@ pub struct ServerConfig {
     pub data_dir: String,
 }
 
+/// 更新配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// 是否启用自动更新（由后端推送触发）
+    #[serde(default)]
+    pub auto_update: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { auto_update: false }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
     /// 代理令牌（proxyToken）
@@ -43,6 +62,11 @@ pub struct AccountConfig {
 
 fn default_data_dir() -> String {
     "/var/lib/chmlfrp-toolbox-daemon".to_string()
+}
+
+/// 默认配置文件路径
+pub fn default_config_path() -> PathBuf {
+    PathBuf::from("/etc/chmlfrp-toolbox-daemon/config.toml")
 }
 
 /// 加载配置文件
@@ -70,6 +94,83 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
     Ok(cfg)
 }
 
+/// 保存配置到文件（原子写入：先写临时文件再 rename）
+pub fn save_config(path: &Path, cfg: &Config) -> anyhow::Result<()> {
+    let toml_str = toml::to_string_pretty(cfg)?;
+    let header = "# ChmlFrp 工具箱 Daemon 配置文件\n\
+                  # 由远程管理自动生成/修改\n\n";
+    let content = format!("{}{}", header, toml_str);
+
+    // 原子写入：先写到临时文件，再 rename
+    let tmp_path = path.with_extension("toml.tmp");
+    fs::write(&tmp_path, &content)?;
+
+    // 设置文件权限为 640
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o640))?;
+    }
+
+    fs::rename(&tmp_path, path)?;
+    info!("配置已保存: {}", path.display());
+    Ok(())
+}
+
+/// 添加账号
+pub fn add_account(path: &Path, token: String, name: String) -> anyhow::Result<()> {
+    let mut cfg = load_config(path)?;
+    // 检查 token 是否已存在
+    if cfg.accounts.iter().any(|a| a.proxy_token == token) {
+        anyhow::bail!("该 proxyToken 已存在");
+    }
+    cfg.accounts.push(AccountConfig {
+        proxy_token: token,
+        device_name: name,
+    });
+    save_config(path, &cfg)
+}
+
+/// 修改账号（按索引，1-based）
+pub fn modify_account(path: &Path, index: usize, token: Option<String>, name: Option<String>) -> anyhow::Result<()> {
+    let mut cfg = load_config(path)?;
+    if index == 0 || index > cfg.accounts.len() {
+        anyhow::bail!("账号序号无效: {}（共 {} 个账号）", index, cfg.accounts.len());
+    }
+    let acc = &mut cfg.accounts[index - 1];
+    if let Some(t) = token {
+        acc.proxy_token = t;
+    }
+    if let Some(n) = name {
+        acc.device_name = n;
+    }
+    save_config(path, &cfg)
+}
+
+/// 删除账号（按索引，1-based）
+pub fn delete_account(path: &Path, index: usize) -> anyhow::Result<()> {
+    let mut cfg = load_config(path)?;
+    if index == 0 || index > cfg.accounts.len() {
+        anyhow::bail!("账号序号无效: {}（共 {} 个账号）", index, cfg.accounts.len());
+    }
+    cfg.accounts.remove(index - 1);
+    save_config(path, &cfg)
+}
+
+/// 修改后端地址
+pub fn set_backend_url(path: &Path, url: String) -> anyhow::Result<()> {
+    let mut cfg = load_config(path)?;
+    cfg.server.backend_url = url;
+    save_config(path, &cfg)
+}
+
+/// 设置自动更新开关
+pub fn set_auto_update(path: &Path, enabled: bool) -> anyhow::Result<()> {
+    let mut cfg = load_config(path)?;
+    cfg.update.auto_update = enabled;
+    save_config(path, &cfg)
+}
+
 /// 生成默认配置模板
 pub fn generate_template(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
@@ -80,6 +181,7 @@ pub fn generate_template(path: &Path) -> anyhow::Result<()> {
             backend_url: "wss://api.cct.zdzz.top".to_string(),
             data_dir: default_data_dir(),
         },
+        update: UpdateConfig::default(),
         accounts: vec![AccountConfig {
             proxy_token: "在此填入你的_proxyToken".to_string(),
             device_name: "我的服务器".to_string(),

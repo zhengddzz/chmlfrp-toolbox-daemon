@@ -7,6 +7,9 @@ pub mod ping;
 pub mod tcping;
 pub mod speedtest;
 pub mod delete_my_data;
+pub mod daemon_config;
+pub mod daemon_service;
+pub mod daemon_update;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -19,6 +22,8 @@ pub struct CommandContext {
     pub device_id: String,
     /// 数据目录
     pub data_dir: String,
+    /// 配置文件路径
+    pub config_path: String,
     /// 关联的 user_id（从 WebSocket 连接中获取，用于多租户隔离）
     pub user_id: Option<i64>,
     /// 当前 RPC 请求的 requestId（用于进度推送关联）
@@ -64,6 +69,7 @@ pub async fn dispatch(
     ctx: &CommandContext,
 ) -> CommandResult {
     match command {
+        // ===== 测试命令 =====
         "ping" => ping::handle(params).await,
         "tcping" => tcping::handle(params).await,
         "node_latency" => {
@@ -90,6 +96,22 @@ pub async fn dispatch(
         }
         "speedtest" => speedtest::handle(params, ctx).await,
         "delete_my_data" => delete_my_data::handle(ctx).await,
+
+        // ===== Daemon 管理命令 =====
+        "daemon_get_config" => daemon_config::get_config(ctx).await,
+        "daemon_add_account" => daemon_config::add_account(params, ctx).await,
+        "daemon_modify_account" => daemon_config::modify_account(params, ctx).await,
+        "daemon_delete_account" => daemon_config::delete_account(params, ctx).await,
+        "daemon_set_backend_url" => daemon_config::set_backend_url(params, ctx).await,
+
+        "daemon_service_control" => daemon_service::service_control(params, ctx).await,
+        "daemon_get_logs" => daemon_service::get_logs(params, ctx).await,
+
+        "daemon_check_update" => daemon_update::check_update(ctx).await,
+        "daemon_perform_update" => daemon_update::perform_update(ctx).await,
+        "daemon_get_update_settings" => daemon_update::get_update_settings(ctx).await,
+        "daemon_set_auto_update" => daemon_update::set_auto_update(params, ctx).await,
+
         _ => Err(RpcError::new("UNKNOWN_COMMAND", format!("不支持的命令: {}", command))),
     }
 }

@@ -48,7 +48,7 @@ fn collect_sys_info() -> (String, String) {
 /// 启动多租户 relay 客户端
 ///
 /// 为每个 account 创建独立的 WebSocket 连接，共享同一个 device_id。
-pub async fn run_multi_tenant(cfg: Config) -> anyhow::Result<()> {
+pub async fn run_multi_tenant(cfg: Config, config_path: String) -> anyhow::Result<()> {
     // 获取或生成 device_id（所有 account 共享）
     let device_id = crate::config::get_or_create_device_id(&cfg.server.data_dir)?;
 
@@ -67,6 +67,7 @@ pub async fn run_multi_tenant(cfg: Config) -> anyhow::Result<()> {
         let hostname = hostname.clone();
         let backend_url = cfg.server.backend_url.clone();
         let data_dir = cfg.server.data_dir.clone();
+        let config_path = config_path.clone();
         let account = account.clone();
 
         let handle = tokio::spawn(async move {
@@ -79,6 +80,7 @@ pub async fn run_multi_tenant(cfg: Config) -> anyhow::Result<()> {
                 hostname,
                 backend_url,
                 data_dir,
+                config_path,
             )
             .await;
         });
@@ -102,6 +104,7 @@ async fn run_single_account(
     hostname: String,
     backend_url: String,
     data_dir: String,
+    config_path: String,
 ) {
     loop {
         match connect_and_run(
@@ -112,6 +115,7 @@ async fn run_single_account(
             &hostname,
             &backend_url,
             &data_dir,
+            &config_path,
         )
         .await
         {
@@ -136,6 +140,7 @@ async fn connect_and_run(
     hostname: &str,
     backend_url: &str,
     data_dir: &str,
+    config_path: &str,
 ) -> anyhow::Result<()> {
     // 构建 WebSocket URL
     // wss://api.cct.zdzz.top/api/devices/ws?token=xxx&deviceId=xxx&deviceType=daemon&osInfo=xxx&hostname=xxx&interconnect=1
@@ -209,6 +214,7 @@ async fn connect_and_run(
                             &mut write,
                             device_id,
                             data_dir,
+                            config_path,
                             &ctx_progress_tx,
                             &mut last_pong,
                         ).await {
@@ -245,6 +251,7 @@ async fn handle_message<W>(
     write: &mut W,
     device_id: &str,
     data_dir: &str,
+    config_path: &str,
     progress_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<ProgressPayload>>>>,
     last_pong: &mut Instant,
 ) -> anyhow::Result<()>
@@ -267,7 +274,25 @@ where
             info!("[relay] {}: {}", msg_type, device_name);
         }
         "rpc_request" => {
-            handle_rpc_request(&msg, write, device_id, data_dir, progress_tx).await?;
+            handle_rpc_request(&msg, write, device_id, data_dir, config_path, progress_tx).await?;
+        }
+        "update_available" => {
+            // 后端推送的更新通知（预留：自动更新功能）
+            let version = msg.get("version").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            info!("[relay] 收到更新通知: v{}", version);
+
+            let ctx = CommandContext {
+                device_id: device_id.to_string(),
+                data_dir: data_dir.to_string(),
+                config_path: config_path.to_string(),
+                user_id: None,
+                request_id: String::new(),
+                progress_tx: progress_tx.clone(),
+            };
+            // 异步处理，不阻塞消息循环
+            tokio::spawn(async move {
+                crate::commands::daemon_update::handle_update_notification(&ctx, &version).await;
+            });
         }
         _ => {
             warn!("[relay] 未知消息类型: {}", msg_type);
@@ -283,6 +308,7 @@ async fn handle_rpc_request<W>(
     write: &mut W,
     device_id: &str,
     data_dir: &str,
+    config_path: &str,
     progress_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<ProgressPayload>>>>,
 ) -> anyhow::Result<()>
 where
@@ -295,15 +321,12 @@ where
     info!("[rpc] 收到请求: {} command={}", request_id, command);
 
     // 构建命令上下文
-    // 注意：user_id 从 WebSocket 连接的 token 解析得到，但当前协议中
-    // rpc_request 消息不携带 user_id。user_id 在连接建立时由后端从 token 解析。
-    // 这里暂时用 None，实际 user_id 需要通过其他方式获取（如连接时后端推送）。
-    // TODO: 后端可在 rpc_request 中携带 userId 字段
     let user_id = msg.get("userId").and_then(|v| v.as_i64());
 
     let ctx = CommandContext {
         device_id: device_id.to_string(),
         data_dir: data_dir.to_string(),
+        config_path: config_path.to_string(),
         user_id,
         request_id: request_id.clone(),
         progress_tx: progress_tx.clone(),
