@@ -18,7 +18,7 @@ fn is_root() -> bool {
     true
 }
 
-/// 构造 systemctl 命令（非 root 时自动加 sudo 前缀）
+/// 构造 systemctl 命令（非 root 时自动加 sudo -n 前缀，-n 表示非交互模式不提示密码）
 fn build_systemctl_cmd(args: &[&str]) -> std::process::Command {
     if is_root() {
         let mut cmd = std::process::Command::new("systemctl");
@@ -26,6 +26,7 @@ fn build_systemctl_cmd(args: &[&str]) -> std::process::Command {
         cmd
     } else {
         let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("-n");
         cmd.arg("systemctl");
         cmd.args(args);
         cmd
@@ -150,7 +151,7 @@ pub async fn get_logs(params: &serde_json::Value, _ctx: &CommandContext) -> Comm
             .map_err(|e| RpcError::new("LOG_FETCH_FAILED", format!("执行 journalctl 失败: {}", e)))?
     } else {
         std::process::Command::new("sudo")
-            .args(&["journalctl", "-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
+            .args(&["-n", "journalctl", "-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
             .output()
             .map_err(|e| RpcError::new("LOG_FETCH_FAILED", format!("执行 journalctl 失败: {}", e)))?
     };
