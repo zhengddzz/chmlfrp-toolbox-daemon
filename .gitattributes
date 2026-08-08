@@ -1,0 +1,13 @@
+# 自动检测文本/二进制
+* text=auto
+
+# Shell 脚本强制使用 LF 换行（跨平台执行必需）
+*.sh text eol=lf
+
+# service 文件强制使用 LF
+*.service text eol=lf
+
+# Windows 专用文件保持 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
