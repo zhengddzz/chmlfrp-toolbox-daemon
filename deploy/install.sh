@@ -148,6 +148,50 @@ create_user() {
     fi
 }
 
+# 配置 sudoers：允许 daemon 用户免密执行更新所需的特权命令
+# 仅在非 root 运行模式下配置（root 模式无需 sudo）
+setup_sudoers() {
+    # root 模式不需要 sudoers
+    if [[ "$APP_USER" == "root" ]]; then
+        return 0
+    fi
+
+    local sudoers_file="/etc/sudoers.d/${APP_NAME}"
+    info "配置 sudoers 规则（允许 ${APP_USER} 免密执行更新命令）..."
+
+    cat > "$sudoers_file" << SUDOERS_EOF
+# ${APP_NAME} - 允许 daemon 用户免密执行更新所需的特权命令
+# 由安装脚本自动生成，请勿手动修改
+
+# dpkg 安装更新包
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/dpkg -i /tmp/${APP_NAME}_update.deb
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/dpkg -i /tmp/${APP_NAME}_update.rpm
+# apt-get 修复依赖
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/apt-get install -f -y
+# rpm 安装更新包
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/rpm -U --force /tmp/${APP_NAME}_update.rpm
+# systemctl 重启服务
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${APP_NAME}
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${APP_NAME}.service
+SUDOERS_EOF
+
+    chmod 440 "$sudoers_file" 2>/dev/null || {
+        warn "sudoers 文件权限设置失败，远程更新可能无法正常工作"
+        return 0
+    }
+
+    # 验证 sudoers 语法（visudo -c）
+    if command -v visudo &>/dev/null; then
+        if ! visudo -cf "$sudoers_file" &>/dev/null; then
+            warn "sudoers 语法错误，删除规则文件"
+            rm -f "$sudoers_file"
+            return 0
+        fi
+    fi
+
+    success "sudoers 规则已配置"
+}
+
 # 确保 service 文件存在：不存在时从模板创建，降级 root 时修补 User/Group
 # 容器/受限环境下 /etc/systemd/system 可能不可写，降级为提示手动管理
 ensure_service_file() {
@@ -783,6 +827,7 @@ uninstall() {
 
     rm -f "$INSTALL_DIR/$APP_NAME"
     rm -f "$SERVICE_FILE"
+    rm -f "/etc/sudoers.d/${APP_NAME}"
     rm -rf "$CONFIG_DIR"
 
     # 仅在非 root 降级模式下清理用户/组
@@ -898,6 +943,7 @@ main() {
     generate_config
     create_data_dir
     ensure_service_file
+    setup_sudoers
 
     # 安装后自动引导配置
     if ! config_is_configured; then

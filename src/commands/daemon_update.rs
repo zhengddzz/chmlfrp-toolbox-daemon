@@ -115,6 +115,9 @@ pub async fn check_update(_ctx: &CommandContext) -> CommandResult {
 }
 
 /// 执行更新（下载 deb + dpkg 安装 + 重启服务）
+///
+/// 注意：下载使用 spawn_blocking 避免阻塞 tokio 运行时（防止心跳超时）。
+/// 安装步骤通过 sudo 执行（安装脚本已配置 sudoers 免密规则）。
 pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
     info!("[update] 开始执行更新流程");
 
@@ -146,79 +149,144 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    // 2. 下载 deb 包
+    // 判断包格式（deb 或 rpm）和是否需要 sudo
+    let is_deb = download_url.ends_with(".deb");
+    let is_rpm = download_url.ends_with(".rpm");
+    let pkg_ext = if is_deb { "deb" } else if is_rpm { "rpm" } else { "deb" };
+
+    // 当前用户是否为 root（root 不需要 sudo）
+    #[cfg(unix)]
+    let is_root = unsafe { libc::geteuid() } == 0;
+    #[cfg(not(unix))]
+    let is_root = true; // 非 Unix 环境无需 sudo
+
+    // 2. 下载安装包（使用 spawn_blocking 避免阻塞心跳）
     let tmp_dir = "/tmp";
-    let deb_path = format!("{}/{}_update.deb", tmp_dir, APP_NAME);
+    let pkg_path = format!("{}/{}_update.{}", tmp_dir, APP_NAME, pkg_ext);
+    let download_url_owned = download_url.to_string();
+    let current_ver = get_current_version();
+    let download_path = pkg_path.clone();
 
-    let client = reqwest::Client::builder()
-        .user_agent(format!("{}/{}", APP_NAME, get_current_version()))
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| RpcError::new("HTTP_CLIENT_FAILED", e.to_string()))?;
+    let download_result = tokio::task::spawn_blocking(move || -> Result<usize, String> {
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(format!("{}/{}", APP_NAME, current_ver))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| format!("HTTP 客户端构建失败: {}", e))?;
 
-    let resp = client
-        .get(download_url)
-        .send()
-        .await
-        .map_err(|e| RpcError::new("DOWNLOAD_FAILED", format!("下载安装包失败: {}", e)))?;
+        let resp = client
+            .get(&download_url_owned)
+            .send()
+            .map_err(|e| format!("下载安装包失败: {}", e))?;
 
-    if !resp.status().is_success() {
-        return Err(RpcError::new(
-            "DOWNLOAD_FAILED",
-            format!("下载返回: {}", resp.status()),
-        ));
-    }
+        if !resp.status().is_success() {
+            return Err(format!("下载返回: {}", resp.status()));
+        }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| RpcError::new("DOWNLOAD_FAILED", format!("读取响应体失败: {}", e)))?;
+        let bytes = resp
+            .bytes()
+            .map_err(|e| format!("读取响应体失败: {}", e))?;
 
-    std::fs::write(&deb_path, &bytes)
-        .map_err(|e| RpcError::new("DOWNLOAD_FAILED", format!("写入临时文件失败: {}", e)))?;
+        std::fs::write(&download_path, &bytes)
+            .map_err(|e| format!("写入临时文件失败: {}", e))?;
 
-    info!("[update] 安装包已下载: {} ({} bytes)", deb_path, bytes.len());
+        Ok(bytes.len())
+    })
+    .await
+    .map_err(|e| RpcError::new("DOWNLOAD_FAILED", format!("下载任务异常: {}", e)))?;
 
-    // 3. dpkg 安装
-    let output = std::process::Command::new("dpkg")
-        .args(&["-i", &deb_path])
+    let downloaded_bytes = download_result
+        .map_err(|e| RpcError::new("DOWNLOAD_FAILED", e))?;
+
+    info!("[update] 安装包已下载: {} ({} bytes)", pkg_path, downloaded_bytes);
+
+    // 3. 安装（使用 sudo，安装脚本已配置 sudoers 免密）
+    let mut install_output = if is_deb {
+        // deb 包：sudo dpkg -i
+        let mut cmd = if is_root {
+            std::process::Command::new("dpkg")
+        } else {
+            let mut c = std::process::Command::new("sudo");
+            c.arg("dpkg");
+            c
+        };
+        cmd.args(&["-i", &pkg_path]);
+        cmd
+    } else {
+        // rpm 包：sudo rpm -U --force
+        let mut cmd = if is_root {
+            std::process::Command::new("rpm")
+        } else {
+            let mut c = std::process::Command::new("sudo");
+            c.arg("rpm");
+            c
+        };
+        cmd.args(&["-U", "--force", &pkg_path]);
+        cmd
+    };
+
+    let output = install_output
         .output()
-        .map_err(|e| RpcError::new("INSTALL_FAILED", format!("执行 dpkg 失败: {}", e)))?;
-
-    // 清理临时文件
-    let _ = std::fs::remove_file(&deb_path);
+        .map_err(|e| RpcError::new("INSTALL_FAILED", format!("执行安装命令失败: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // 尝试自动修复依赖
-        let fix_output = std::process::Command::new("apt-get")
-            .args(&["install", "-f", "-y"])
-            .output();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        warn!("[update] 安装失败: stderr={}, stdout={}", stderr, stdout);
 
-        if let Ok(fo) = fix_output {
-            if !fo.status.success() {
+        // deb 包尝试自动修复依赖
+        if is_deb {
+            info!("[update] 尝试修复依赖...");
+            let fix_output = if is_root {
+                std::process::Command::new("apt-get")
+                    .args(&["install", "-f", "-y"])
+                    .output()
+            } else {
+                std::process::Command::new("sudo")
+                    .args(&["apt-get", "install", "-f", "-y"])
+                    .output()
+            };
+
+            if let Ok(fo) = fix_output {
+                if !fo.status.success() {
+                    // 清理临时文件
+                    let _ = std::fs::remove_file(&pkg_path);
+                    return Err(RpcError::new(
+                        "INSTALL_FAILED",
+                        format!("dpkg 安装失败且依赖修复失败: {}", stderr),
+                    ));
+                }
+            } else {
+                let _ = std::fs::remove_file(&pkg_path);
                 return Err(RpcError::new(
                     "INSTALL_FAILED",
-                    format!("dpkg 安装失败且依赖修复失败: {}", stderr),
+                    format!("dpkg 安装失败: {}", stderr),
                 ));
             }
         } else {
+            let _ = std::fs::remove_file(&pkg_path);
             return Err(RpcError::new(
                 "INSTALL_FAILED",
-                format!("dpkg 安装失败: {}", stderr),
+                format!("rpm 安装失败: {}", stderr),
             ));
         }
     }
 
+    // 清理临时文件
+    let _ = std::fs::remove_file(&pkg_path);
+
     info!("[update] 安装完成，正在重启服务...");
 
-    // 4. 重启服务（注意：这会导致当前进程退出）
+    // 4. 重启服务（使用 sudo systemctl restart）
     // 使用单独的子进程执行重启，确保 RPC 响应能先返回
+    let restart_cmd = if is_root {
+        format!("sleep 1 && systemctl restart {}", APP_NAME)
+    } else {
+        format!("sleep 1 && sudo systemctl restart {}", APP_NAME)
+    };
+
     std::process::Command::new("sh")
-        .args(&[
-            "-c",
-            &format!("sleep 1 && systemctl restart {}", APP_NAME),
-        ])
+        .args(&["-c", &restart_cmd])
         .spawn()
         .map_err(|e| RpcError::new("RESTART_FAILED", format!("启动重启进程失败: {}", e)))?;
 
