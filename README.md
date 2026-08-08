@@ -45,7 +45,7 @@ curl -fsSL https://api.cct.zdzz.top/chmlfrp-toolbox-daemon/install.sh | sudo bas
 3. 输入设备名称（默认使用主机名）
 4. 询问是否立即启动服务
 
-### 手动安装 deb 包
+### 手动安装 deb 包（Ubuntu / Debian）
 
 ```bash
 # x64
@@ -55,6 +55,20 @@ sudo apt-get install -f  # 修复依赖
 # ARM64
 sudo dpkg -i chmlfrp-toolbox-daemon_arm64.deb
 sudo apt-get install -f  # 修复依赖
+```
+
+### 手动安装 rpm 包（CentOS / RHEL / Fedora）
+
+```bash
+# x64
+sudo dnf install -y chmlfrp-toolbox-daemon_x64.rpm
+# 或 CentOS 7
+sudo yum install -y chmlfrp-toolbox-daemon_x64.rpm
+
+# ARM64
+sudo dnf install -y chmlfrp-toolbox-daemon_arm64.rpm
+# 或 CentOS 7
+sudo yum install -y chmlfrp-toolbox-daemon_arm64.rpm
 ```
 
 手动安装后需自行编辑配置文件：

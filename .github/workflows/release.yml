@@ -18,13 +18,15 @@ jobs:
           - platform: ubuntu-22.04
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            arch: amd64
+            arch: x64
             deb_suffix: amd64
+            rpm_arch: x86_64
           - platform: ubuntu-22.04-arm
             runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             arch: arm64
             deb_suffix: arm64
+            rpm_arch: aarch64
 
     steps:
       - name: Checkout
@@ -35,8 +37,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
+      - name: Install cargo-deb and cargo-generate-rpm
+        run: |
+          cargo install cargo-deb
+          cargo install cargo-generate-rpm
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
@@ -44,11 +48,20 @@ jobs:
       - name: Build deb package
         run: cargo deb --target ${{ matrix.target }} --output chmlfrp-toolbox-daemon_${{ matrix.deb_suffix }}.deb
 
+      - name: Build rpm package
+        run: cargo generate-rpm --target ${{ matrix.target }} --output chmlfrp-toolbox-daemon_${{ matrix.arch }}.rpm
+
       - name: Upload deb artifact
         uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.arch }}
           path: chmlfrp-toolbox-daemon_${{ matrix.deb_suffix }}.deb
+
+      - name: Upload rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: chmlfrp-toolbox-daemon_${{ matrix.arch }}.rpm
 
   release:
     name: Create Release
@@ -66,8 +79,10 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release
-          cp artifacts/deb-amd64/*.deb release/
+          cp artifacts/deb-x64/*.deb release/
           cp artifacts/deb-arm64/*.deb release/
+          cp artifacts/rpm-x64/*.rpm release/
+          cp artifacts/rpm-arm64/*.rpm release/
           cp deploy/install.sh release/
 
       - name: Create GitHub Release
@@ -93,11 +108,13 @@ jobs:
 
             #### 一键安装（推荐）
 
+            适用于 Ubuntu / Debian / CentOS / RHEL / Fedora 等，自动识别包管理器：
+
             ```bash
             curl -fsSL https://api.cct.zdzz.top/chmlfrp-toolbox-daemon/install.sh | sudo bash
             ```
 
-            #### 手动安装
+            #### 手动安装 - deb 包（Ubuntu / Debian）
 
             ```bash
             # x64
@@ -109,13 +126,28 @@ jobs:
             sudo apt-get install -f
             ```
 
+            #### 手动安装 - rpm 包（CentOS / RHEL / Fedora）
+
+            ```bash
+            # x64
+            sudo dnf install -y chmlfrp-toolbox-daemon_x64.rpm
+            # 或 CentOS 7
+            sudo yum install -y chmlfrp-toolbox-daemon_x64.rpm
+
+            # ARM64
+            sudo dnf install -y chmlfrp-toolbox-daemon_arm64.rpm
+            # 或 CentOS 7
+            sudo yum install -y chmlfrp-toolbox-daemon_arm64.rpm
+            ```
+
             ### 系统要求
 
             - Linux x64 或 ARM64 (aarch64)
-            - Ubuntu 20.04+ / Debian 11+ / CentOS 8+ / Raspberry Pi OS (Bookworm) / Armbian
+            - Ubuntu 20.04+ / Debian 11+ / CentOS 8+ / RHEL 8+ / Fedora 35+ / Raspberry Pi OS (Bookworm) / Armbian
             - 不支持 32 位 ARM (armv7) 设备
           files: |
             release/*.deb
+            release/*.rpm
             release/install.sh
           draft: false
           prerelease: false

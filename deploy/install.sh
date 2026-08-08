@@ -227,6 +227,7 @@ download_file() {
 
 download_from_github() {
     local arch=$1
+    local pkg_type=$2  # deb | rpm
     local tmp_dir
     tmp_dir=$(mktemp -d)
     trap "rm -rf $tmp_dir" EXIT
@@ -239,23 +240,25 @@ download_from_github() {
         error "无法获取 Release 信息，请检查网络连接或稍后重试（GitHub API 可能有访问限制）"
     fi
 
-    local deb_pattern
-    case "$arch" in
-        x64)   deb_pattern="_amd64.deb" ;;
-        arm64) deb_pattern="_arm64.deb" ;;
+    local pkg_pattern
+    case "${pkg_type}_${arch}" in
+        deb_x64)   pkg_pattern="_amd64.deb" ;;
+        deb_arm64) pkg_pattern="_arm64.deb" ;;
+        rpm_x64)   pkg_pattern="_x64.rpm" ;;
+        rpm_arm64) pkg_pattern="_arm64.rpm" ;;
     esac
 
     local download_url
-    download_url=$(echo "$release_info" | grep -o "https://[^\"]*${deb_pattern}" | head -1)
+    download_url=$(echo "$release_info" | grep -o "https://[^\"]*${pkg_pattern}" | head -1)
 
     if [[ -z "$download_url" ]]; then
-        error "未找到架构 ${arch} 的安装包"
+        error "未找到架构 ${arch} 的 ${pkg_type} 安装包"
     fi
 
-    local deb_file="${tmp_dir}/${APP_NAME}.deb"
+    local pkg_file="${tmp_dir}/${APP_NAME}.${pkg_type}"
     info "正在下载: $download_url"
-    download_file "$download_url" "$deb_file" || error "下载 deb 包失败"
-    echo "$deb_file"
+    download_file "$download_url" "$pkg_file" || error "下载 ${pkg_type} 包失败"
+    echo "$pkg_file"
 }
 
 # ===== 安装 =====
@@ -281,7 +284,11 @@ install_rpm() {
     elif command -v yum &>/dev/null; then
         yum install -y "$rpm_file" || error "RPM 安装失败"
     else
-        error "无法找到 RPM 包管理器"
+        error "无法找到 RPM 包管理器（dnf/yum）"
+    fi
+    # 验证二进制是否安装成功
+    if [[ ! -x "$INSTALL_DIR/$APP_NAME" ]]; then
+        error "安装失败：未找到 $INSTALL_DIR/$APP_NAME，请检查 rpm 包是否完整"
     fi
     success "安装完成"
 }
@@ -590,11 +597,16 @@ main() {
         case "$pkg_manager" in
             apt)
                 local deb_file
-                deb_file=$(download_from_github "$arch")
+                deb_file=$(download_from_github "$arch" "deb")
                 install_deb "$deb_file"
                 ;;
+            yum|dnf)
+                local rpm_file
+                rpm_file=$(download_from_github "$arch" "rpm")
+                install_rpm "$rpm_file"
+                ;;
             *)
-                error "RPM 系统请使用 --local 参数指定本地 rpm 包"
+                error "不支持的包管理器: $pkg_manager（仅支持 apt/yum/dnf）"
                 ;;
         esac
     fi

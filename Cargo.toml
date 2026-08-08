@@ -1,6 +1,6 @@
 [package]
 name = "chmlfrp-toolbox-daemon"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "ChmlFrp 社区工具箱 Daemon - 服务器端远程管理守护进程"
 license = "MIT"
@@ -62,3 +62,31 @@ assets = [
     ["deploy/config-template.toml", "etc/chmlfrp-toolbox-daemon/config.toml.example", "640"],
 ]
 systemd-units = { unit-name = "chmlfrp-toolbox-daemon", enable = false, start = false }
+
+# ===== RPM 打包配置（CentOS/RHEL/Fedora）=====
+[package.metadata.generate-rpm]
+summary = "ChmlFrp Community Toolbox Daemon"
+license = "MIT"
+url = "https://github.com/zhengddzz/chmlfrp-toolbox-daemon"
+description = "ChmlFrp 社区工具箱 Daemon - 服务器端远程管理守护进程"
+requires = { openssl-libs = "*", systemd = "*" }
+
+assets = [
+    { source = "target/release/chmlfrp-toolbox-daemon", dest = "/usr/bin/chmlfrp-toolbox-daemon", mode = "755" },
+    { source = "deploy/chmlfrp-toolbox-daemon.service", dest = "/etc/systemd/system/chmlfrp-toolbox-daemon.service", mode = "644" },
+    { source = "deploy/config-template.toml", dest = "/etc/chmlfrp-toolbox-daemon/config.toml.example", mode = "640" },
+]
+
+# 安装后自动设置开机自启（不立即启动，等用户配置后启动）
+[package.metadata.generate-rpm.postinst]
+script = """
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable chmlfrp-toolbox-daemon 2>/dev/null || true
+"""
+
+# 卸载前停止服务
+[package.metadata.generate-rpm.preuninst]
+script = """
+systemctl stop chmlfrp-toolbox-daemon 2>/dev/null || true
+systemctl disable chmlfrp-toolbox-daemon 2>/dev/null || true
+"""
