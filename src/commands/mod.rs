@@ -6,6 +6,8 @@
 pub mod ping;
 pub mod tcping;
 pub mod speedtest;
+pub mod tcp_speed_test;
+pub mod e2e_server;
 pub mod delete_my_data;
 pub mod daemon_config;
 pub mod daemon_service;
@@ -95,6 +97,9 @@ pub async fn dispatch(
             }))
         }
         "speedtest" => speedtest::handle(params, ctx).await,
+        "tcp_speed_test" => tcp_speed_test::handle(params, ctx).await,
+        "e2e_setup" => e2e_server::handle_setup(params, ctx).await,
+        "e2e_cleanup" => e2e_server::handle_cleanup(params, ctx).await,
         "delete_my_data" => delete_my_data::handle(ctx).await,
 
         // ===== Daemon 管理命令 =====

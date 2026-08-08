@@ -159,7 +159,6 @@ ensure_service_file() {
         if ! cat > "$SERVICE_FILE" 2>/dev/null << EOF
 [Unit]
 Description=ChmlFrp Community Toolbox Daemon
-Description[zh_CN]=ChmlFrp 社区工具箱 Daemon
 After=network-online.target
 Wants=network-online.target
 
@@ -572,23 +571,91 @@ service_start() {
 
     # 检测 systemd 是否可用（容器环境可能未运行 systemd）
     if ! command -v systemctl &>/dev/null || [[ ! -d /run/systemd/system ]]; then
-        warn "systemd 不可用（可能是容器环境），无法通过 systemctl 管理服务"
-        info "可手动运行: $INSTALL_DIR/$APP_NAME --config $CONFIG_FILE start"
-        return 0
+        warn "systemd 不可用（可能是容器环境），改用后台方式启动"
+        service_start_nohup
+        return $?
     fi
 
     systemctl daemon-reload
     systemctl enable "$APP_NAME" 2>/dev/null || true
-    if config_is_configured; then
-        if systemctl start "$APP_NAME"; then
-            success "服务已启动"
-        else
-            warn "服务启动失败，请检查日志: journalctl -u $APP_NAME -e"
-        fi
-    else
+
+    if ! config_is_configured; then
         warn "配置尚未完成，请完成配置后运行: sudo systemctl start $APP_NAME"
+        success "已设置开机自启"
+        return 0
     fi
+
+    # 尝试通过 systemctl 启动（root 在非交互 shell 下可能被 polkit 拦截）
+    local start_err
+    start_err=$(systemctl start "$APP_NAME" 2>&1)
+    if [[ $? -eq 0 ]] && systemctl is-active --quiet "$APP_NAME"; then
+        success "服务已启动"
+        success "已设置开机自启"
+        return 0
+    fi
+
+    # systemctl 失败：判断是否为 polkit 交互认证拦截
+    if echo "$start_err" | grep -qiE "Interactive authentication required|Access denied|insufficient privilege"; then
+        warn "systemctl 被拦截（需要交互认证），改用 systemd-run 启动..."
+        # 方案一：systemd-run 启动 transient 服务单元
+        if command -v systemd-run &>/dev/null; then
+            if systemd-run --no-block --unit="${APP_NAME}-run" \
+                --description="ChmlFrp Toolbox Daemon (transient)" \
+                --property=Restart=always \
+                --property=RestartSec=5 \
+                "$INSTALL_DIR/$APP_NAME" --config "$CONFIG_FILE" start 2>&1 | grep -v "^$"; then
+                sleep 1
+                if systemctl is-active --quiet "${APP_NAME}-run"; then
+                    success "服务已通过 systemd-run 启动"
+                    warn "注：使用临时单元 ${APP_NAME}-run，重启后需用 systemctl start $APP_NAME 启动"
+                    success "已设置开机自启"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+
+    # 降级方案：nohup 后台运行
+    warn "systemd 启动失败：$start_err"
+    warn "降级为后台进程方式启动..."
+    service_start_nohup
     success "已设置开机自启"
+}
+
+# 后台进程方式启动（不依赖 systemd 服务管理）
+service_start_nohup() {
+    if ! config_is_configured; then
+        warn "配置尚未完成，无法启动"
+        return 1
+    fi
+
+    # 停止旧进程
+    pkill -f "$INSTALL_DIR/$APP_NAME" 2>/dev/null || true
+    sleep 1
+
+    # 启动新进程
+    local log_file="${DATA_DIR}/daemon.log"
+    mkdir -p "$DATA_DIR"
+    chown "$APP_USER":"$APP_GROUP" "$DATA_DIR" 2>/dev/null || true
+
+    if [[ "$APP_USER" == "root" ]]; then
+        nohup "$INSTALL_DIR/$APP_NAME" --config "$CONFIG_FILE" start >> "$log_file" 2>&1 &
+    else
+        nohup su -s /bin/bash "$APP_USER" -c \
+            "\"$INSTALL_DIR/$APP_NAME\" --config \"$CONFIG_FILE\" start" >> "$log_file" 2>&1 &
+    fi
+
+    local pid=$!
+    sleep 2
+
+    if kill -0 "$pid" 2>/dev/null; then
+        success "服务已后台启动 (PID: $pid)"
+        info "日志文件: $log_file"
+        info "停止命令: kill $pid"
+        return 0
+    else
+        error "后台启动失败，请检查日志: $log_file"
+    fi
 }
 
 # ===== 交互式配置引导 =====
