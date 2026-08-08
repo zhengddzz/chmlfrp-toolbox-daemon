@@ -286,6 +286,39 @@ get_latest_version() {
     fi
 }
 
+# 生成 UUID（兼容多种系统）
+generate_uuid() {
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        cat /proc/sys/kernel/random/uuid
+    elif command -v uuidgen &>/dev/null; then
+        uuidgen | tr 'A-Z' 'a-z'
+    elif command -v openssl &>/dev/null; then
+        openssl rand -hex 16
+    else
+        error "无法生成 UUID，请安装 uuidgen 或 openssl"
+    fi
+}
+
+# 从 WebSocket URL 获取 HTTP API URL（wss→https, ws→http）
+get_api_base_url() {
+    local ws_url
+    ws_url=$(config_get_backend_url)
+    echo "$ws_url" | sed 's|^wss://|https://|; s|^ws://|http://|'
+}
+
+# 从 JSON 字符串中提取指定键的值（单层键）
+json_get() {
+    local json=$1
+    local key=$2
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r ".$key" 2>/dev/null
+    elif command -v python3 &>/dev/null; then
+        echo "$json" | python3 -c "import json,sys; d=json.load(sys.stdin); v=d.get('$key'); print(v if v is not None else '')" 2>/dev/null
+    elif command -v python &>/dev/null; then
+        echo "$json" | python -c "import json,sys; d=json.load(sys.stdin); v=d.get('$key'); print(v if v is not None else '')" 2>/dev/null
+    fi
+}
+
 download_package() {
     local arch=$1
     local pkg_type=$2  # deb | rpm
@@ -618,20 +651,79 @@ add_account_interactive() {
     echo ""
     echo "--- 添加账号 ---"
     echo ""
-    echo "请输入 proxyToken（从桌面客户端获取）："
-    echo "  获取方式：打开桌面客户端 → 设置 → 查看登录信息 → proxyToken"
-    echo ""
-    read -p "proxyToken: " -r token < /dev/tty
-    if [[ -z "$token" ]]; then
-        warn "proxyToken 不能为空，已取消"
-        return 1
-    fi
+
+    # 输入设备名称
     local default_name
     default_name=$(hostname 2>/dev/null || echo "服务器")
     read -p "设备名称 [${default_name}]: " -r name < /dev/tty
     name="${name:-$default_name}"
-    config_add_account "$token" "$name"
-    success "账号已添加: $name"
+
+    # 生成授权 session
+    local api_base
+    api_base=$(get_api_base_url)
+    local session_id
+    session_id=$(generate_uuid)
+    local auth_url="${api_base}/auth/login?session=${session_id}"
+
+    # 预创建 pending 会话（用户打开链接时也会自动创建/更新）
+    info "正在创建授权会话..."
+    download_file "$auth_url" "-" >/dev/null 2>&1 || true
+
+    # 显示授权链接
+    echo ""
+    echo "请在浏览器中打开以下链接完成授权登录："
+    echo ""
+    echo -e "  ${CYAN}${BOLD}${auth_url}${NC}"
+    echo ""
+    warn "授权有效期：5分钟，请尽快完成"
+    echo ""
+
+    # 轮询授权状态
+    info "等待授权完成（请勿关闭此终端）..."
+    local elapsed=0
+    local max_wait=300
+    local poll_interval=3
+    while [[ $elapsed -lt $max_wait ]]; do
+        local remaining=$((max_wait - elapsed))
+        printf "\r剩余时间: %02d:%02d  " $((remaining / 60)) $((remaining % 60))
+
+        sleep $poll_interval
+        elapsed=$((elapsed + poll_interval))
+
+        local status_data
+        status_data=$(download_file "${api_base}/auth/status?session=${session_id}" "-" 2>/dev/null || echo "")
+
+        if [[ -z "$status_data" ]]; then
+            continue
+        fi
+
+        local status
+        status=$(json_get "$status_data" "status")
+
+        case "$status" in
+            completed)
+                local proxy_token
+                proxy_token=$(json_get "$status_data" "proxyToken")
+                if [[ -n "$proxy_token" ]] && [[ "$proxy_token" != "null" ]]; then
+                    echo ""
+                    success "授权成功"
+                    config_add_account "$proxy_token" "$name"
+                    success "账号已添加: $name"
+                    return 0
+                fi
+                ;;
+            failed)
+                echo ""
+                error "授权失败，请重新运行安装"
+                ;;
+            not_found|pending)
+                # 等待用户完成授权
+                ;;
+        esac
+    done
+
+    echo ""
+    error "授权超时（5分钟内未完成），请重新运行安装"
 }
 
 # ===== 卸载 =====
