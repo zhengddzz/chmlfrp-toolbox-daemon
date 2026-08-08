@@ -629,11 +629,17 @@ service_start() {
         return 0
     fi
 
-    # 尝试通过 systemctl 启动（root 在非交互 shell 下可能被 polkit 拦截）
+    # 判断服务是否已在运行：运行中用 restart，未运行用 start
+    local action="start"
+    if systemctl is-active --quiet "$APP_NAME" 2>/dev/null; then
+        action="restart"
+    fi
+
+    # 尝试通过 systemctl 启动/重启（root 在非交互 shell 下可能被 polkit 拦截）
     local start_err
-    start_err=$(systemctl start "$APP_NAME" 2>&1)
+    start_err=$(systemctl "$action" "$APP_NAME" 2>&1)
     if [[ $? -eq 0 ]] && systemctl is-active --quiet "$APP_NAME"; then
-        success "服务已启动"
+        success "服务已${action}"
         success "已设置开机自启"
         return 0
     fi
@@ -659,8 +665,8 @@ service_start() {
         fi
     fi
 
-    # 降级方案：nohup 后台运行
-    warn "systemd 启动失败：$start_err"
+    # 降级方案：nohup 后台运行（会先停止旧进程）
+    warn "systemd ${action} 失败：$start_err"
     warn "降级为后台进程方式启动..."
     service_start_nohup
     success "已设置开机自启"
