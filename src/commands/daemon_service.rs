@@ -46,11 +46,9 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
 
     match p.action.as_str() {
         "status" => {
+            // 直接返回扁平结构，前端 normalizeStatus 可直接解析
             let status = get_service_status();
-            Ok(serde_json::json!({
-                "success": true,
-                "status": status,
-            }))
+            Ok(status)
         }
         "restart" => {
             // 通过 systemd 重启自身
@@ -105,7 +103,7 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
     }
 }
 
-/// 获取服务状态
+/// 获取服务状态（扁平结构，前端可直接解析）
 fn get_service_status() -> serde_json::Value {
     let active_state = std::process::Command::new("systemctl")
         .args(&["is-active", APP_NAME])
@@ -123,9 +121,18 @@ fn get_service_status() -> serde_json::Value {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    let active = active_state.eq_ignore_ascii_case("active");
+    let enabled = enabled_state.eq_ignore_ascii_case("enabled")
+        || enabled_state.eq_ignore_ascii_case("static")
+        || enabled_state.eq_ignore_ascii_case("enabled-runtime");
+
     serde_json::json!({
+        "success": true,
+        "active": active,
+        "enabled": enabled,
         "activeState": active_state,
         "enabledState": enabled_state,
+        "statusText": format!("{} / {}", active_state, enabled_state),
     })
 }
 
