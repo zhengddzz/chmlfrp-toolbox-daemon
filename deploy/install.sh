@@ -170,9 +170,16 @@ ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/dpkg -i /tmp/${APP_NAME}_update.rpm
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/apt-get install -f -y
 # rpm 安装更新包
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/rpm -U --force /tmp/${APP_NAME}_update.rpm
-# systemctl 重启服务
+# systemctl 服务控制（start/stop/restart）
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${APP_NAME}
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${APP_NAME}.service
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${APP_NAME}
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${APP_NAME}.service
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${APP_NAME}
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${APP_NAME}.service
+# journalctl 查看日志
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/journalctl -u ${APP_NAME} *
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/journalctl -u ${APP_NAME}.service *
 SUDOERS_EOF
 
     chmod 440 "$sudoers_file" 2>/dev/null || {
@@ -572,6 +579,8 @@ config_is_configured() {
 generate_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         mkdir -p "$CONFIG_DIR"
+        chmod 770 "$CONFIG_DIR"
+        chown root:"$APP_GROUP" "$CONFIG_DIR"
         cat > "$CONFIG_FILE" << EOF
 # ChmlFrp 工具箱 Daemon 配置文件
 # 由 install.sh 生成于 $(date '+%Y-%m-%d %H:%M:%S')
@@ -586,11 +595,16 @@ data_dir = "${DATA_DIR}"
 # proxy_token = "你的proxyToken"
 # device_name = "设备名称"
 EOF
-        chmod 640 "$CONFIG_FILE"
+        chmod 660 "$CONFIG_FILE"
         chown root:"$APP_GROUP" "$CONFIG_FILE"
         success "配置文件已生成: $CONFIG_FILE"
     else
         info "配置文件已存在，跳过生成"
+        # 修复旧版权限：确保目录和配置文件可被 daemon 用户组写入
+        chmod 770 "$CONFIG_DIR" 2>/dev/null || true
+        chown root:"$APP_GROUP" "$CONFIG_DIR" 2>/dev/null || true
+        chmod 660 "$CONFIG_FILE" 2>/dev/null || true
+        chown root:"$APP_GROUP" "$CONFIG_FILE" 2>/dev/null || true
     fi
 }
 

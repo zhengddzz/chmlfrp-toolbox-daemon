@@ -105,11 +105,11 @@ pub fn save_config(path: &Path, cfg: &Config) -> anyhow::Result<()> {
     let tmp_path = path.with_extension("toml.tmp");
     fs::write(&tmp_path, &content)?;
 
-    // 设置文件权限为 640
+    // 设置文件权限为 660（允许 daemon 用户组读写）
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o640))?;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o660))?;
     }
 
     fs::rename(&tmp_path, path)?;

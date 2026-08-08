@@ -8,6 +8,30 @@ use serde::Deserialize;
 
 const APP_NAME: &str = "chmlfrp-toolbox-daemon";
 
+/// 检测当前用户是否为 root
+#[cfg(unix)]
+fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+#[cfg(not(unix))]
+fn is_root() -> bool {
+    true
+}
+
+/// 构造 systemctl 命令（非 root 时自动加 sudo 前缀）
+fn build_systemctl_cmd(args: &[&str]) -> std::process::Command {
+    if is_root() {
+        let mut cmd = std::process::Command::new("systemctl");
+        cmd.args(args);
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("systemctl");
+        cmd.args(args);
+        cmd
+    }
+}
+
 /// 服务控制
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,8 +55,7 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
             // 通过 systemd 重启自身
             // 注意：重启会导致当前进程退出，WebSocket 连接断开
             // 客户端需要在收到响应后等待重连
-            let output = std::process::Command::new("systemctl")
-                .args(&["restart", APP_NAME])
+            let output = build_systemctl_cmd(&["restart", APP_NAME])
                 .output()
                 .map_err(|e| RpcError::new("SERVICE_CONTROL_FAILED", format!("执行 systemctl 失败: {}", e)))?;
 
@@ -47,8 +70,7 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
             }
         }
         "stop" => {
-            let output = std::process::Command::new("systemctl")
-                .args(&["stop", APP_NAME])
+            let output = build_systemctl_cmd(&["stop", APP_NAME])
                 .output()
                 .map_err(|e| RpcError::new("SERVICE_CONTROL_FAILED", format!("执行 systemctl 失败: {}", e)))?;
 
@@ -64,8 +86,7 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
         }
         "start" => {
             // 启动服务（通常在 stop 后使用）
-            let output = std::process::Command::new("systemctl")
-                .args(&["start", APP_NAME])
+            let output = build_systemctl_cmd(&["start", APP_NAME])
                 .output()
                 .map_err(|e| RpcError::new("SERVICE_CONTROL_FAILED", format!("执行 systemctl 失败: {}", e)))?;
 
@@ -121,10 +142,18 @@ pub async fn get_logs(params: &serde_json::Value, _ctx: &CommandContext) -> Comm
 
     let lines = p.lines.unwrap_or(50).min(500);
 
-    let output = std::process::Command::new("journalctl")
-        .args(&["-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
-        .output()
-        .map_err(|e| RpcError::new("LOG_FETCH_FAILED", format!("执行 journalctl 失败: {}", e)))?;
+    // journalctl 读取日志需要 root 权限（部分系统）
+    let output = if is_root() {
+        std::process::Command::new("journalctl")
+            .args(&["-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
+            .output()
+            .map_err(|e| RpcError::new("LOG_FETCH_FAILED", format!("执行 journalctl 失败: {}", e)))?
+    } else {
+        std::process::Command::new("sudo")
+            .args(&["journalctl", "-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
+            .output()
+            .map_err(|e| RpcError::new("LOG_FETCH_FAILED", format!("执行 journalctl 失败: {}", e)))?
+    };
 
     let logs = String::from_utf8_lossy(&output.stdout).to_string();
 
