@@ -75,40 +75,44 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## 安装方式
+            ## 软件介绍
 
-            ### 一键安装（推荐）
+            ChmlFrp 社区工具箱 Daemon 是部署在 Linux 服务器上的远程管理守护进程，配合 ChmlFrp 社区工具箱桌面客户端使用。
+
+            ### 核心功能
+
+            - **端到端延迟测试**：支持 ICMP Ping 和 TCP Ping，测量服务器到 ChmlFrp 各节点的网络延迟
+            - **端到端带宽测试**：通过 HTTP 下载/上传测速，评估服务器到节点的实际带宽
+            - **远程配置管理**：通过桌面客户端远程查看和修改配置，包括账号增删改、后端地址修改
+            - **远程服务控制**：远程启动、停止、重启服务，查看运行状态
+            - **远程日志查看**：在线查看服务运行日志，无需 SSH 登录服务器
+            - **在线检查更新**：一键检查并安装最新版本，支持自动更新开关
+            - **多租户支持**：一台服务器可同时被多个账号绑定，数据按用户隔离
+
+            ### 安装方式
+
+            #### 一键安装（推荐）
 
             ```bash
-            # 下载 install.sh 后执行
-            sudo bash install.sh
+            curl -fsSL https://api.cct.zdzz.top/chmlfrp-toolbox-daemon/install.sh | sudo bash
             ```
 
-            ### 手动安装（deb 包）
+            #### 手动安装
 
-            #### Linux (x64)
             ```bash
+            # x64
             sudo dpkg -i chmlfrp-toolbox-daemon_amd64.deb
-            sudo apt-get install -f  # 修复依赖
-            ```
+            sudo apt-get install -f
 
-            #### Linux (ARM64)
-            ```bash
+            # ARM64
             sudo dpkg -i chmlfrp-toolbox-daemon_arm64.deb
-            sudo apt-get install -f  # 修复依赖
+            sudo apt-get install -f
             ```
 
-            ### 安装后配置
-
-            1. 编辑配置文件：`sudo nano /etc/chmlfrp-toolbox-daemon/config.toml`
-            2. 填入你的 `proxyToken`
-            3. 启动服务：`sudo systemctl start chmlfrp-toolbox-daemon`
-            4. 查看日志：`sudo journalctl -u chmlfrp-toolbox-daemon -f`
-
-            ## 系统要求
+            ### 系统要求
 
             - Linux x64 或 ARM64 (aarch64)
-            - Ubuntu 22.04+ / Debian 12+ / Raspberry Pi OS (Bookworm) / Armbian
+            - Ubuntu 20.04+ / Debian 11+ / CentOS 8+ / Raspberry Pi OS (Bookworm) / Armbian
             - 不支持 32 位 ARM (armv7) 设备
           files: |
             release/*.deb
