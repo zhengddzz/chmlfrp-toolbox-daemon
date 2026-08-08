@@ -3,12 +3,17 @@
 # ChmlFrp 社区工具箱 Daemon 一键安装脚本
 #
 # 功能：
-#   1. 下载并安装 Daemon（deb 包）
+#   1. 自动识别包管理器（apt/yum/dnf），下载并安装 Daemon（deb 或 rpm 包）
 #   2. 安装后自动引导用户配置 proxyToken
+#   3. 兼容容器/受限环境（自动降级为 root 运行）
+#
+# 支持：
+#   - 架构：x64 (x86_64)、ARM64 (aarch64)
+#   - 系统：Ubuntu / Debian / CentOS / RHEL / Fedora / Raspberry Pi OS / Armbian
 #
 # 用法：
 #   sudo bash install.sh                    # 安装（安装后自动引导配置）
-#   sudo bash install.sh --local <path>     # 使用本地 deb 包安装
+#   sudo bash install.sh --local <path>     # 使用本地 deb/rpm 包安装
 #   sudo bash install.sh --uninstall        # 卸载
 #
 # 在线一键安装：
@@ -42,12 +47,12 @@ GITHUB_REPO="zhengddzz/chmlfrp-toolbox-daemon"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
 DEFAULT_BACKEND_URL="wss://api.cct.zdzz.top"
 
-# ===== 输出函数 =====
-info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
-success() { echo -e "${GREEN}[OK]${NC} $1"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
-error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
-title()   { echo -e "\n${BOLD}${CYAN}=== $1 ===${NC}\n"; }
+# ===== 输出函数（输出到 stderr，避免干扰函数返回值）=====
+info()    { echo -e "${BLUE}[INFO]${NC} $1" >&2; }
+success() { echo -e "${GREEN}[OK]${NC} $1" >&2; }
+warn()    { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; exit 1; }
+title()   { echo -e "\n${BOLD}${CYAN}=== $1 ===${NC}\n" >&2; }
 
 # ===== 基础检查 =====
 check_root() {
@@ -548,7 +553,7 @@ main() {
                 echo ""
                 echo "选项:"
                 echo "  (无参数)          安装并引导配置"
-                echo "  --local <path>    使用本地 deb 包安装"
+                echo "  --local <path>    使用本地 deb/rpm 包安装"
                 echo "  --uninstall       卸载 Daemon"
                 echo "  --help            显示帮助"
                 echo ""
