@@ -83,7 +83,6 @@ jobs:
           cp artifacts/deb-arm64/*.deb release/
           cp artifacts/rpm-x64/*.rpm release/
           cp artifacts/rpm-arm64/*.rpm release/
-          cp deploy/install.sh release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -113,6 +112,8 @@ jobs:
             ```bash
             curl -fsSL https://api.cct.zdzz.top/chmlfrp-toolbox-daemon/install.sh | sudo bash
             ```
+
+            > 安装脚本由后端 API 独立托管，不在 Release 附件中提供，便于单独更新。
 
             #### 手动安装 - deb 包（Ubuntu / Debian）
 
@@ -148,6 +149,5 @@ jobs:
           files: |
             release/*.deb
             release/*.rpm
-            release/install.sh
           draft: false
           prerelease: false
