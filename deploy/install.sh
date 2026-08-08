@@ -706,6 +706,11 @@ main() {
 
     check_root
 
+    # curl | bash 管道方式下 stdin 被占用，重新绑定到 /dev/tty 以支持交互输入
+    if [[ ! -t 0 ]] && [[ -t /dev/tty ]]; then
+        exec 0</dev/tty
+    fi
+
     # 脚本退出时清理临时下载文件
     trap "rm -f /tmp/${APP_NAME}_install.deb /tmp/${APP_NAME}_install.rpm" EXIT
 
