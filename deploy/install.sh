@@ -149,11 +149,14 @@ create_user() {
 }
 
 # 确保 service 文件存在：不存在时从模板创建，降级 root 时修补 User/Group
+# 容器/受限环境下 /etc/systemd/system 可能不可写，降级为提示手动管理
 ensure_service_file() {
     # service 文件不存在（deb 包未包含或安装失败），从模板创建
     if [[ ! -f "$SERVICE_FILE" ]]; then
         info "service 文件不存在，正在创建..."
-        cat > "$SERVICE_FILE" << EOF
+
+        # 尝试写入 service 文件
+        if ! cat > "$SERVICE_FILE" 2>/dev/null << EOF
 [Unit]
 Description=ChmlFrp Community Toolbox Daemon
 Description[zh_CN]=ChmlFrp 社区工具箱 Daemon
@@ -181,24 +184,31 @@ Environment=RUST_LOG=info
 [Install]
 WantedBy=multi-user.target
 EOF
-        chmod 644 "$SERVICE_FILE"
+        then
+            warn "无法写入 $SERVICE_FILE（权限受限）"
+            info "service 文件需手动创建，或直接运行: $INSTALL_DIR/$APP_NAME --config $CONFIG_FILE start"
+            return 0
+        fi
+        chmod 644 "$SERVICE_FILE" 2>/dev/null || true
         success "service 文件已创建: $SERVICE_FILE"
         return 0
     fi
 
-    # 文件已存在：降级到 root 时修补 User=/Group= 行
-    if [[ "$APP_USER" == "root" ]]; then
+    # 文件已存在：降级到 root 时修补 User=/Group= 行和 ExecStart 路径
+    if [[ "$APP_USER" == "root" ]] || [[ "$INSTALL_DIR" != "/usr/bin" ]]; then
         local changed=false
         if grep -q '^User=' "$SERVICE_FILE"; then
-            sed -i 's|^User=.*|User=root|' "$SERVICE_FILE"
-            changed=true
+            sed -i 's|^User=.*|User=root|' "$SERVICE_FILE" 2>/dev/null && changed=true
         fi
         if grep -q '^Group=' "$SERVICE_FILE"; then
-            sed -i 's|^Group=.*|Group=root|' "$SERVICE_FILE"
-            changed=true
+            sed -i 's|^Group=.*|Group=root|' "$SERVICE_FILE" 2>/dev/null && changed=true
+        fi
+        # 修正 ExecStart 路径（手动安装可能改到了 /usr/local/bin）
+        if grep -q '^ExecStart=' "$SERVICE_FILE"; then
+            sed -i "s|^ExecStart=.*|ExecStart=${INSTALL_DIR}/${APP_NAME} --config ${CONFIG_FILE} start|" "$SERVICE_FILE" 2>/dev/null && changed=true
         fi
         if $changed; then
-            info "已将 service 运行用户调整为 root（适配受限环境）"
+            info "已调整 service 配置（运行用户: root，路径: $INSTALL_DIR）"
         fi
     fi
 }
@@ -309,35 +319,120 @@ download_package() {
 }
 
 # ===== 安装 =====
+
+# 手动解压 deb 包并安装二进制（容器/受限环境下 dpkg 失败时的降级方案）
+# service 文件由 ensure_service_file 自动创建，不依赖 deb 包
+install_deb_manual() {
+    local deb_file=$1
+    local tmp_extract
+    tmp_extract=$(mktemp -d)
+    trap "rm -rf $tmp_extract" RETURN
+
+    info "尝试手动解压 deb 包安装..."
+    if ! dpkg-deb -x "$deb_file" "$tmp_extract" 2>/dev/null; then
+        error "解压 deb 包失败，请检查文件是否完整"
+    fi
+
+    # 查找二进制文件并复制
+    local bin_src="${tmp_extract}/usr/bin/${APP_NAME}"
+    if [[ ! -f "$bin_src" ]]; then
+        error "deb 包中未找到二进制文件 usr/bin/${APP_NAME}"
+    fi
+
+    cp "$bin_src" "$INSTALL_DIR/$APP_NAME" 2>/dev/null || {
+        # /usr/bin 可能也受限，尝试 /usr/local/bin
+        INSTALL_DIR="/usr/local/bin"
+        cp "$bin_src" "$INSTALL_DIR/$APP_NAME" || error "无法复制二进制到 $INSTALL_DIR"
+    }
+    chmod 755 "$INSTALL_DIR/$APP_NAME"
+
+    # 更新 service 文件中的 ExecStart 路径（若 INSTALL_DIR 变化）
+    if [[ "$INSTALL_DIR" != "/usr/bin" ]]; then
+        info "二进制安装到: $INSTALL_DIR/$APP_NAME"
+    fi
+
+    success "手动安装完成"
+}
+
 install_deb() {
     local deb_file=$1
     info "正在安装..."
-    if ! dpkg -i "$deb_file"; then
-        warn "依赖缺失或安装失败，尝试自动修复..."
-        apt-get install -f -y || error "依赖安装失败，请手动运行: apt-get install -f"
+    if dpkg -i "$deb_file" 2>/dev/null; then
+        # dpkg 成功，验证二进制
+        if [[ -x "$INSTALL_DIR/$APP_NAME" ]]; then
+            success "安装完成"
+            return 0
+        fi
     fi
-    # 验证二进制是否安装成功
-    if [[ ! -x "$INSTALL_DIR/$APP_NAME" ]]; then
-        error "安装失败：未找到 $INSTALL_DIR/$APP_NAME，请检查 deb 包是否完整"
+
+    # dpkg 失败或二进制不存在，尝试自动修复依赖
+    warn "dpkg 安装失败（可能是容器/受限环境），尝试自动修复..."
+    if apt-get install -f -y 2>/dev/null && [[ -x "$INSTALL_DIR/$APP_NAME" ]]; then
+        success "依赖修复后安装完成"
+        return 0
     fi
-    success "安装完成"
+
+    # 仍然失败，降级为手动解压安装
+    install_deb_manual "$deb_file"
+}
+
+# 手动解压 rpm 包并安装二进制（容器/受限环境下 rpm 失败时的降级方案）
+install_rpm_manual() {
+    local rpm_file=$1
+    local tmp_extract
+    tmp_extract=$(mktemp -d)
+    trap "rm -rf $tmp_extract" RETURN
+
+    info "尝试手动解压 rpm 包安装..."
+    if command -v rpm2cpio &>/dev/null && command -v cpio &>/dev/null; then
+        rpm2cpio "$rpm_file" | cpio -idmv -D "$tmp_extract" 2>/dev/null || error "解压 rpm 包失败"
+    else
+        error "解压 rpm 包需要 rpm2cpio 和 cpio，请安装后重试"
+    fi
+
+    # 查找二进制文件并复制
+    local bin_src="${tmp_extract}/usr/bin/${APP_NAME}"
+    if [[ ! -f "$bin_src" ]]; then
+        # 尝试在解压目录中搜索
+        bin_src=$(find "$tmp_extract" -name "$APP_NAME" -type f 2>/dev/null | head -1)
+        if [[ -z "$bin_src" ]]; then
+            error "rpm 包中未找到二进制文件 ${APP_NAME}"
+        fi
+    fi
+
+    cp "$bin_src" "$INSTALL_DIR/$APP_NAME" 2>/dev/null || {
+        INSTALL_DIR="/usr/local/bin"
+        cp "$bin_src" "$INSTALL_DIR/$APP_NAME" || error "无法复制二进制到 $INSTALL_DIR"
+    }
+    chmod 755 "$INSTALL_DIR/$APP_NAME"
+
+    if [[ "$INSTALL_DIR" != "/usr/bin" ]]; then
+        info "二进制安装到: $INSTALL_DIR/$APP_NAME"
+    fi
+
+    success "手动安装完成"
 }
 
 install_rpm() {
     local rpm_file=$1
     info "正在安装..."
     if command -v dnf &>/dev/null; then
-        dnf install -y "$rpm_file" || error "RPM 安装失败"
+        if dnf install -y "$rpm_file" 2>/dev/null && [[ -x "$INSTALL_DIR/$APP_NAME" ]]; then
+            success "安装完成"
+            return 0
+        fi
     elif command -v yum &>/dev/null; then
-        yum install -y "$rpm_file" || error "RPM 安装失败"
+        if yum install -y "$rpm_file" 2>/dev/null && [[ -x "$INSTALL_DIR/$APP_NAME" ]]; then
+            success "安装完成"
+            return 0
+        fi
     else
         error "无法找到 RPM 包管理器（dnf/yum）"
     fi
-    # 验证二进制是否安装成功
-    if [[ ! -x "$INSTALL_DIR/$APP_NAME" ]]; then
-        error "安装失败：未找到 $INSTALL_DIR/$APP_NAME，请检查 rpm 包是否完整"
-    fi
-    success "安装完成"
+
+    # rpm 安装失败，降级为手动解压
+    warn "rpm 安装失败（可能是容器/受限环境）"
+    install_rpm_manual "$rpm_file"
 }
 
 # ===== 配置文件读写函数 =====
