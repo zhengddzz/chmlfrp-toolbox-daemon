@@ -89,63 +89,14 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## 软件介绍
+            ## v0.3.6 更新汇总
 
-            ChmlFrp 社区工具箱 Daemon 是部署在 Linux 服务器上的远程管理守护进程，配合 ChmlFrp 社区工具箱桌面客户端使用。
+            ### Bug 修复
+            - **更新安装失败**：修复服务启用系统安全限制后，安装更新时无法执行系统安装命令的问题。
+            - **远程日志读取**：服务直接读取 systemd 日志，并补充日志读取权限，避免日志查看失败。
 
-            ### 核心功能
-
-            - **端到端延迟测试**：支持 ICMP Ping 和 TCP Ping，测量服务器到 ChmlFrp 各节点的网络延迟
-            - **端到端带宽测试**：通过 HTTP 下载/上传测速，评估服务器到节点的实际带宽
-            - **远程配置管理**：通过桌面客户端远程查看和修改配置，包括账号增删改、后端地址修改
-            - **远程服务控制**：远程启动、停止、重启服务，查看运行状态
-            - **远程日志查看**：在线查看服务运行日志，无需 SSH 登录服务器
-            - **在线检查更新**：一键检查并安装最新版本，支持自动更新开关
-            - **多租户支持**：一台服务器可同时被多个账号绑定，数据按用户隔离
-
-            ### 安装方式
-
-            #### 一键安装（推荐）
-
-            适用于 Ubuntu / Debian / CentOS / RHEL / Fedora 等，自动识别包管理器：
-
-            ```bash
-            curl -fsSL https://api.cct.zdzz.top/chmlfrp-toolbox-daemon/install.sh | sudo bash
-            ```
-
-            > 安装脚本由后端 API 独立托管，不在 Release 附件中提供，便于单独更新。
-
-            #### 手动安装 - deb 包（Ubuntu / Debian）
-
-            ```bash
-            # x64
-            sudo dpkg -i chmlfrp-toolbox-daemon_amd64.deb
-            sudo apt-get install -f
-
-            # ARM64
-            sudo dpkg -i chmlfrp-toolbox-daemon_arm64.deb
-            sudo apt-get install -f
-            ```
-
-            #### 手动安装 - rpm 包（CentOS / RHEL / Fedora）
-
-            ```bash
-            # x64
-            sudo dnf install -y chmlfrp-toolbox-daemon_x64.rpm
-            # 或 CentOS 7
-            sudo yum install -y chmlfrp-toolbox-daemon_x64.rpm
-
-            # ARM64
-            sudo dnf install -y chmlfrp-toolbox-daemon_arm64.rpm
-            # 或 CentOS 7
-            sudo yum install -y chmlfrp-toolbox-daemon_arm64.rpm
-            ```
-
-            ### 系统要求
-
-            - Linux x64 或 ARM64 (aarch64)
-            - Ubuntu 20.04+ / Debian 11+ / CentOS 8+ / RHEL 8+ / Fedora 35+ / Raspberry Pi OS (Bookworm) / Armbian
-            - 不支持 32 位 ARM (armv7) 设备
+            ### 安全调整
+            - **更新权限控制**：保留文件系统保护和指定命令白名单，仅放开更新安装所需的权限。
           files: |
             release/*.deb
             release/*.rpm
