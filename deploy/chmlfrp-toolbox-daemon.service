@@ -15,7 +15,7 @@ StandardOutput=journal
 StandardError=journal
 
 # 安全限制
-NoNewPrivileges=true
+NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/chmlfrp-toolbox-daemon
