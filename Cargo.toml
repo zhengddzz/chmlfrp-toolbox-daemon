@@ -1,6 +1,6 @@
 [package]
 name = "chmlfrp-toolbox-daemon"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "ChmlFrp 社区工具箱 Daemon - 服务器端远程管理守护进程"
 license = "MIT"
@@ -43,6 +43,8 @@ anyhow = "1"
 urlencoding = "2"
 # libc（检测当前用户 uid）
 libc = "0.2"
+# SHA-256 校验（daemon 更新包校验）
+sha2 = "0.10"
 
 [profile.release]
 opt-level = 3

@@ -199,6 +199,13 @@ SUDOERS_EOF
     success "sudoers 规则已配置"
 }
 
+setup_journal_access() {
+    if [[ "$APP_USER" == "root" ]] || ! getent group systemd-journal &>/dev/null; then
+        return 0
+    fi
+    usermod -aG systemd-journal "$APP_USER" 2>/dev/null || warn "无法将 ${APP_USER} 加入 systemd-journal 组"
+}
+
 # 确保 service 文件存在：不存在时从模板创建，降级 root 时修补 User/Group
 # 容器/受限环境下 /etc/systemd/system 可能不可写，降级为提示手动管理
 ensure_service_file() {
@@ -963,6 +970,7 @@ main() {
     generate_config
     create_data_dir
     ensure_service_file
+    setup_journal_access
     setup_sudoers
 
     # 安装后自动引导配置

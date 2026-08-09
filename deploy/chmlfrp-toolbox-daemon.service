@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=chmlfrp-daemon
 Group=chmlfrp-daemon
+SupplementaryGroups=systemd-journal
 ExecStart=/usr/bin/chmlfrp-toolbox-daemon --config /etc/chmlfrp-toolbox-daemon/config.toml start
 Restart=always
 RestartSec=5

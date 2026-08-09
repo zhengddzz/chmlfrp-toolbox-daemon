@@ -150,24 +150,41 @@ pub async fn get_logs(params: &serde_json::Value, _ctx: &CommandContext) -> Comm
 
     let lines = p.lines.unwrap_or(50).min(500);
 
-    // journalctl 读取日志需要 root 权限（部分系统）
-    let output = if is_root() {
-        std::process::Command::new("journalctl")
-            .args(&["-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
-            .output()
-            .map_err(|e| RpcError::new("LOG_FETCH_FAILED", format!("执行 journalctl 失败: {}", e)))?
-    } else {
-        std::process::Command::new("sudo")
-            .args(&["-n", "journalctl", "-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
-            .output()
-            .map_err(|e| RpcError::new("LOG_FETCH_FAILED", format!("执行 journalctl 失败: {}", e)))?
-    };
+    let output = std::process::Command::new("journalctl")
+        .args(&["-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
+        .output()
+        .map_err(|e| RpcError::new("LOG_FETCH_FAILED", format!("执行 journalctl 失败: {}", e)))?;
 
-    let logs = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // journalctl 执行失败（权限不足、服务不存在等）：返回 stderr 作为诊断信息
+    if !output.status.success() {
+        let diag = if stderr.trim().is_empty() {
+            format!("journalctl 退出码: {}", output.status.code().unwrap_or(-1))
+        } else {
+            stderr.trim().to_string()
+        };
+        // 仍然返回 success=true，但 logs 携带诊断信息，前端能显示出来
+        return Ok(serde_json::json!({
+            "success": true,
+            "logs": format!("[获取日志失败] {}\n\n提示：请确认服务已通过 systemd 启动，且当前用户有 journalctl 读取权限。", diag),
+            "lines": lines,
+        }));
+    }
+
+    // 成功但无日志：返回提示
+    if stdout.trim().is_empty() {
+        return Ok(serde_json::json!({
+            "success": true,
+            "logs": format!("[暂无日志] 服务 {} 当前没有 journalctl 日志记录。\n可能原因：服务刚启动、日志已被轮转、或未通过 systemd 启动。", APP_NAME),
+            "lines": lines,
+        }));
+    }
 
     Ok(serde_json::json!({
         "success": true,
-        "logs": logs,
+        "logs": stdout,
         "lines": lines,
     }))
 }

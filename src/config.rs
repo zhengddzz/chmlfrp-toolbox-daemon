@@ -171,6 +171,64 @@ pub fn set_auto_update(path: &Path, enabled: bool) -> anyhow::Result<()> {
     save_config(path, &cfg)
 }
 
+// ===== auto_update 独立存储（避免写入 /etc 只读文件系统） =====
+
+/// auto_update override 文件路径（位于 data_dir 下，daemon 用户可写）
+fn auto_update_override_path(data_dir: &str) -> PathBuf {
+    PathBuf::from(data_dir).join("update_settings.json")
+}
+
+/// 读取 auto_update override（data_dir/update_settings.json）
+///
+/// 返回 Some(bool) 表示 override 文件存在且已设置；None 表示未设置，应 fallback 到主配置。
+pub fn load_auto_update_override(data_dir: &str) -> Option<bool> {
+    let path = auto_update_override_path(data_dir);
+    if !path.exists() {
+        return None;
+    }
+    let content = fs::read_to_string(&path).ok()?;
+    #[derive(Deserialize)]
+    struct OverrideFile {
+        auto_update: bool,
+    }
+    let parsed: OverrideFile = serde_json::from_str(&content).ok()?;
+    Some(parsed.auto_update)
+}
+
+/// 保存 auto_update override 到 data_dir/update_settings.json
+///
+/// data_dir 通常是 /var/lib/chmlfrp-toolbox-daemon/，daemon 用户有写入权限，
+/// 避免直接修改 /etc/chmlfrp-toolbox-daemon/config.toml 导致 Read-only file system 错误。
+pub fn save_auto_update_override(data_dir: &str, enabled: bool) -> anyhow::Result<()> {
+    let dir = Path::new(data_dir);
+    fs::create_dir_all(dir)?;
+
+    let path = auto_update_override_path(data_dir);
+    let content = serde_json::json!({ "auto_update": enabled }).to_string();
+    fs::write(&path, content)?;
+
+    // 设置文件权限为 600（仅 daemon 用户可读写）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    info!("auto_update override 已保存: {} = {}", path.display(), enabled);
+    Ok(())
+}
+
+/// 获取 auto_update 最终值：优先读 data_dir override，fallback 到主配置
+pub fn get_effective_auto_update(config_path: &Path, data_dir: &str) -> bool {
+    if let Some(val) = load_auto_update_override(data_dir) {
+        return val;
+    }
+    // fallback 到主配置（可能不存在或读取失败，默认 false）
+    load_config(config_path)
+        .map(|cfg| cfg.update.auto_update)
+        .unwrap_or(false)
+}
+
 /// 生成默认配置模板
 pub fn generate_template(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
