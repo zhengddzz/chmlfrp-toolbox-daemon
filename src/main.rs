@@ -3,10 +3,11 @@
 //! 通过 WebSocket 连接后端中继，被桌面客户端远程执行延迟/带宽测试。
 //! 支持多租户：一个 Daemon 可同时被多个 qzhua 账号绑定。
 
+mod commands;
 mod config;
 mod db;
 mod relay;
-mod commands;
+mod telemetry;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -18,7 +19,12 @@ use tracing_subscriber::EnvFilter;
 #[command(name = "chmlfrp-toolbox-daemon", version, about)]
 struct Cli {
     /// 配置文件路径
-    #[arg(short, long, global = true, default_value = "/etc/chmlfrp-toolbox-daemon/config.toml")]
+    #[arg(
+        short,
+        long,
+        global = true,
+        default_value = "/etc/chmlfrp-toolbox-daemon/config.toml"
+    )]
     config: PathBuf,
 
     #[command(subcommand)]
@@ -42,8 +48,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 初始化日志
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .with_env_filter(filter)

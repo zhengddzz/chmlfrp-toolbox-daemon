@@ -39,6 +39,8 @@ struct TcpSpeedTestParams {
     /// 读超时（秒），默认 60
     #[serde(default = "default_read_timeout")]
     read_timeout_secs: u64,
+    #[serde(default)]
+    run_id: String,
 }
 
 fn default_size_mb() -> usize {
@@ -65,12 +67,7 @@ struct TcpSpeedTestResult {
 
 /// 推送进度（非关键错误忽略）
 /// 使用 try_lock 避免在 spawn_blocking 中 await
-fn send_progress(
-    ctx: &super::CommandContext,
-    progress: f64,
-    stage: &str,
-    speed_mbps: f64,
-) {
+fn send_progress(ctx: &super::CommandContext, progress: f64, stage: &str, speed_mbps: f64) {
     if let Ok(tx) = ctx.progress_tx.try_lock() {
         if let Some(sender) = tx.as_ref() {
             let _ = sender.send(super::ProgressPayload {
@@ -111,9 +108,23 @@ pub async fn handle(
     let read_timeout = p.read_timeout_secs;
     let request_id = ctx.request_id.clone();
     let progress_tx = ctx.progress_tx.clone();
+    let run_id = p.run_id.clone();
+    let account_id = ctx.account_id.clone();
+    let generation = super::run_generation(&account_id, &run_id);
 
     let result = tokio::task::spawn_blocking(move || {
-        run_tcp_speed_test(&host, port, size_mb, connect_timeout, read_timeout, &request_id, &progress_tx)
+        run_tcp_speed_test(
+            &host,
+            port,
+            size_mb,
+            connect_timeout,
+            read_timeout,
+            &request_id,
+            &account_id,
+            &run_id,
+            generation,
+            &progress_tx,
+        )
     })
     .await
     .map_err(|e| super::RpcError::new("EXEC_FAILED", format!("任务执行失败: {}", e)))?;
@@ -141,7 +152,12 @@ fn run_tcp_speed_test(
     connect_timeout_secs: u64,
     read_timeout_secs: u64,
     request_id: &str,
-    progress_tx: &std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<super::ProgressPayload>>>>,
+    account_id: &str,
+    run_id: &str,
+    generation: u64,
+    progress_tx: &std::sync::Arc<
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<super::ProgressPayload>>>,
+    >,
 ) -> Result<TcpSpeedTestResult, String> {
     let target_bytes = (size_mb as u64) * 1024 * 1024;
 
@@ -156,17 +172,20 @@ fn run_tcp_speed_test(
     let start = Instant::now();
 
     // 建立连接
-    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(connect_timeout_secs))
-        .map_err(|e| format!("连接失败: {}", e))?;
+    let mut stream =
+        TcpStream::connect_timeout(&socket_addr, Duration::from_secs(connect_timeout_secs))
+            .map_err(|e| format!("连接失败: {}", e))?;
 
     // 设置超时
-    let read_timeout = Duration::from_secs(read_timeout_secs);
+    let read_timeout = Duration::from_millis(200);
     stream.set_read_timeout(Some(read_timeout)).ok();
     stream.set_write_timeout(Some(read_timeout)).ok();
 
     // 发送测速命令
     let cmd = format!("SPEEDTEST {}\n", size_mb);
-    stream.write_all(cmd.as_bytes()).map_err(|e| format!("发送命令失败: {}", e))?;
+    stream
+        .write_all(cmd.as_bytes())
+        .map_err(|e| format!("发送命令失败: {}", e))?;
 
     // 接收数据
     let mut buf = vec![0u8; READ_BUF_SIZE];
@@ -174,6 +193,9 @@ fn run_tcp_speed_test(
     let mut last_progress = Instant::now();
 
     loop {
+        if super::is_run_cancelled(account_id, run_id, generation) {
+            return Err("测速已强制停止".to_string());
+        }
         match stream.read(&mut buf) {
             Ok(0) => break, // EOF，服务端发完关闭连接
             Ok(n) => {
@@ -192,11 +214,24 @@ fn run_tcp_speed_test(
                     } else {
                         0.0
                     };
-                    push_progress(progress_tx, request_id, progress, "downloading", current_speed);
+                    push_progress(
+                        progress_tx,
+                        request_id,
+                        progress,
+                        "downloading",
+                        current_speed,
+                    );
                     last_progress = Instant::now();
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(ref e)
+                if (e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut)
+                    && start.elapsed() < Duration::from_secs(read_timeout_secs) =>
+            {
+                continue
+            }
             Err(e) => {
                 return Ok(TcpSpeedTestResult {
                     success: received > 0,
@@ -233,7 +268,9 @@ fn calc_speed(bytes: u64, elapsed: Duration) -> f64 {
 
 /// 推送进度到 relay（在 spawn_blocking 中使用 try_lock）
 fn push_progress(
-    tx: &std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<super::ProgressPayload>>>>,
+    tx: &std::sync::Arc<
+        tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<super::ProgressPayload>>>,
+    >,
     request_id: &str,
     progress: f64,
     stage: &str,

@@ -3,19 +3,127 @@
 //! 被 relay 调用，执行具体的远程命令。
 //! 所有命令返回 serde_json::Value，与 API 需求文档 6.1-6.5 对齐。
 
-pub mod ping;
-pub mod tcping;
-pub mod speedtest;
-pub mod tcp_speed_test;
-pub mod e2e_server;
-pub mod delete_my_data;
 pub mod daemon_config;
 pub mod daemon_service;
 pub mod daemon_update;
+pub mod delete_my_data;
+pub mod dns_failover_probe;
+pub mod e2e_server;
+pub mod ping;
+pub mod speedtest;
+pub mod tcp_speed_test;
+pub mod tcping;
+pub mod tunnel_latency_test;
 
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
+
+#[derive(Default)]
+struct RunRegistry {
+    entries: HashMap<String, RunState>,
+    order: VecDeque<String>,
+    next_generation: u64,
+}
+
+const MAX_RUN_ENTRIES: usize = 4096;
+
+struct RunState {
+    generation: u64,
+    cancelled: bool,
+}
+
+impl RunRegistry {
+    fn generation(&mut self, run_id: &str) -> u64 {
+        if let Some(state) = self.entries.get(run_id) {
+            return state.generation;
+        }
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        self.entries.insert(
+            run_id.to_string(),
+            RunState {
+                generation,
+                cancelled: false,
+            },
+        );
+        self.order.push_back(run_id.to_string());
+        while self.entries.len() > MAX_RUN_ENTRIES {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+        generation
+    }
+
+    fn cancel(&mut self, run_id: &str) {
+        let generation = self.generation(run_id);
+        self.entries.insert(
+            run_id.to_string(),
+            RunState {
+                generation,
+                cancelled: true,
+            },
+        );
+    }
+
+    fn is_cancelled(&self, run_id: &str, generation: u64) -> bool {
+        self.entries
+            .get(run_id)
+            .map(|state| state.generation != generation || state.cancelled)
+            .unwrap_or(true)
+    }
+
+    fn finish(&mut self, run_id: &str, generation: u64) -> bool {
+        if self.entries.get(run_id).map(|state| state.generation) != Some(generation) {
+            return false;
+        }
+        self.entries.remove(run_id);
+        self.order.retain(|key| key != run_id);
+        true
+    }
+}
+
+static RUN_REGISTRY: Lazy<StdMutex<RunRegistry>> =
+    Lazy::new(|| StdMutex::new(RunRegistry::default()));
+
+fn run_key(account_id: &str, run_id: &str) -> String {
+    format!("{}:{}", account_id, run_id)
+}
+
+pub fn run_generation(account_id: &str, run_id: &str) -> u64 {
+    let key = run_key(account_id, run_id);
+    RUN_REGISTRY
+        .lock()
+        .map(|mut registry| registry.generation(&key))
+        .unwrap_or(0)
+}
+
+pub fn cancel_run(account_id: &str, run_id: &str) {
+    let key = run_key(account_id, run_id);
+    if let Ok(mut registry) = RUN_REGISTRY.lock() {
+        registry.cancel(&key);
+    }
+}
+
+pub fn is_run_cancelled(account_id: &str, run_id: &str, generation: u64) -> bool {
+    let key = run_key(account_id, run_id);
+    RUN_REGISTRY
+        .lock()
+        .map(|registry| registry.is_cancelled(&key, generation))
+        .unwrap_or(true)
+}
+
+pub fn finish_run(account_id: &str, run_id: &str, generation: u64) -> bool {
+    let key = run_key(account_id, run_id);
+    RUN_REGISTRY
+        .lock()
+        .map(|mut registry| registry.finish(&key, generation))
+        .unwrap_or(false)
+}
 
 /// 命令执行上下文
 #[derive(Debug, Clone)]
@@ -26,6 +134,8 @@ pub struct CommandContext {
     pub data_dir: String,
     /// 配置文件路径
     pub config_path: String,
+    pub proxy_token: String,
+    pub account_id: String,
     /// 关联的 user_id（从 WebSocket 连接中获取，用于多租户隔离）
     pub user_id: Option<i64>,
     /// 当前 RPC 请求的 requestId（用于进度推送关联）
@@ -98,6 +208,8 @@ pub async fn dispatch(
         }
         "speedtest" => speedtest::handle(params, ctx).await,
         "tcp_speed_test" => tcp_speed_test::handle(params, ctx).await,
+        "tunnel_latency_test" => tunnel_latency_test::handle(params, ctx).await,
+        "dns_failover_probe_v1" => dns_failover_probe::handle(params).await,
         "e2e_setup" => e2e_server::handle_setup(params, ctx).await,
         "e2e_cleanup" => e2e_server::handle_cleanup(params, ctx).await,
         "delete_my_data" => delete_my_data::handle(ctx).await,
@@ -117,6 +229,46 @@ pub async fn dispatch(
         "daemon_get_update_settings" => daemon_update::get_update_settings(ctx).await,
         "daemon_set_auto_update" => daemon_update::set_auto_update(params, ctx).await,
 
-        _ => Err(RpcError::new("UNKNOWN_COMMAND", format!("不支持的命令: {}", command))),
+        _ => Err(RpcError::new(
+            "UNKNOWN_COMMAND",
+            format!("不支持的命令: {}", command),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RunRegistry, MAX_RUN_ENTRIES};
+
+    #[test]
+    fn old_generation_cannot_clear_reused_run() {
+        let mut registry = RunRegistry::default();
+        let first = registry.generation("run-1");
+        assert!(registry.finish("run-1", first));
+        let second = registry.generation("run-1");
+        assert_ne!(first, second);
+        assert!(!registry.finish("run-1", first));
+        registry.cancel("run-1");
+        assert!(registry.is_cancelled("run-1", second));
+    }
+
+    #[test]
+    fn old_generation_is_cancelled_after_reuse() {
+        let mut registry = RunRegistry::default();
+        let first = registry.generation("run-1");
+        assert!(registry.finish("run-1", first));
+        let second = registry.generation("run-1");
+        assert!(registry.is_cancelled("run-1", first));
+        assert!(!registry.is_cancelled("run-1", second));
+    }
+
+    #[test]
+    fn registry_discards_oldest_entries_at_capacity() {
+        let mut registry = RunRegistry::default();
+        for index in 0..=MAX_RUN_ENTRIES {
+            registry.generation(&format!("run-{}", index));
+        }
+        assert_eq!(registry.entries.len(), MAX_RUN_ENTRIES);
+        assert!(!registry.entries.contains_key("run-0"));
     }
 }

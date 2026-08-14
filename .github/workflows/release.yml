@@ -42,8 +42,11 @@ jobs:
           cargo install cargo-deb
           cargo install cargo-generate-rpm
 
+      - name: Run tests
+        run: cargo test --locked
+
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Build deb package
         run: cargo deb --target ${{ matrix.target }} --output chmlfrp-toolbox-daemon_${{ matrix.deb_suffix }}.deb
@@ -89,14 +92,17 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## v0.3.6 更新汇总
+            ## v0.3.7 更新汇总
+
+            ### 新增功能
+            - **全链路节点测试**：支持通过中转节点完成远程延迟和带宽测试。
+            - **DNS 容灾探测**：支持由服务器执行 DNS 容灾状态探测。
+            - **运行事件上报**：补充服务运行、远程操作和请求结果记录。
 
             ### Bug 修复
-            - **更新安装失败**：修复服务启用系统安全限制后，安装更新时无法执行系统安装命令的问题。
-            - **远程日志读取**：服务直接读取 systemd 日志，并补充日志读取权限，避免日志查看失败。
-
-            ### 安全调整
-            - **更新权限控制**：保留文件系统保护和指定命令白名单，仅放开更新安装所需的权限。
+            - **中继连接稳定性**：优化心跳、重连和长任务处理，测速期间仍能正常接收取消与清理请求。
+            - **任务取消处理**：支持接收测试批次取消请求，并由清理流程回收 frpc、临时隧道和测速服务。
+            - **并发资源保护**：避免迟到的清理请求停止其他批次正在使用的资源。
           files: |
             release/*.deb
             release/*.rpm

@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 /// 心跳间隔
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// 心跳超时（超过此时间未收到 pong 判定连接异常，主动断开重连）
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 /// 重连延迟
@@ -61,6 +61,7 @@ pub async fn run_multi_tenant(cfg: Config, config_path: String) -> anyhow::Resul
     // 为每个 account 启动独立连接
     let mut handles = Vec::new();
 
+    let session_id = uuid::Uuid::new_v4().to_string();
     for (idx, account) in cfg.accounts.iter().enumerate() {
         let device_id = device_id.clone();
         let os_info = os_info.clone();
@@ -70,8 +71,30 @@ pub async fn run_multi_tenant(cfg: Config, config_path: String) -> anyhow::Resul
         let config_path = config_path.clone();
         let account = account.clone();
 
+        let reporter_backend_url = backend_url.clone();
+        let reporter_data_dir = data_dir.clone();
+        let reporter_token = account.proxy_token.clone();
+        let start_event = crate::telemetry::UsageEvent::new(
+            "app_start",
+            serde_json::json!({ "device_type": "daemon" }),
+            &session_id,
+        );
+        if let Err(err) =
+            crate::telemetry::enqueue(&reporter_data_dir, &reporter_token, &start_event)
+        {
+            warn!("[telemetry] 写入启动事件失败: {}", err);
+        }
+        tokio::spawn(crate::telemetry::run_reporter(
+            reporter_backend_url,
+            reporter_data_dir,
+            reporter_token,
+        ));
+
         let handle = tokio::spawn(async move {
-            info!("[account {}] 启动连接: device_name={}", idx, account.device_name);
+            info!(
+                "[account {}] 启动连接: device_name={}",
+                idx, account.device_name
+            );
             run_single_account(
                 idx,
                 account,
@@ -124,7 +147,12 @@ async fn run_single_account(
                 break;
             }
             Err(e) => {
-                warn!("[account {}] 连接断开: {}，{} 秒后重连", idx, e, RECONNECT_DELAY.as_secs());
+                warn!(
+                    "[account {}] 连接断开: {}，{} 秒后重连",
+                    idx,
+                    e,
+                    RECONNECT_DELAY.as_secs()
+                );
                 tokio::time::sleep(RECONNECT_DELAY).await;
             }
         }
@@ -145,12 +173,13 @@ async fn connect_and_run(
     // 构建 WebSocket URL
     // wss://api.cct.zdzz.top/api/devices/ws?token=xxx&deviceId=xxx&deviceType=daemon&osInfo=xxx&hostname=xxx&interconnect=1
     let ws_url = format!(
-        "{}/api/devices/ws?token={}&deviceId={}&deviceType=daemon&osInfo={}&hostname={}&interconnect=1",
+        "{}/api/devices/ws?token={}&deviceId={}&deviceType=daemon&osInfo={}&hostname={}&interconnect=1&capabilities={}",
         backend_url,
         urlencoding::encode(&account.proxy_token),
         device_id,
         urlencoding::encode(os_info),
         urlencoding::encode(hostname),
+        urlencoding::encode("{\"dns_failover_probe\":1,\"full_chain_test\":2}"),
     );
 
     info!("[account {}] 连接: {}", idx, backend_url);
@@ -170,6 +199,7 @@ async fn connect_and_run(
 
     // 进度推送通道（speedtest 等长任务使用）
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressPayload>();
+    let (response_tx, mut response_rx) = mpsc::unbounded_channel::<String>();
 
     // 进度推送上下文（共享给命令处理器）
     let ctx_progress_tx = Arc::new(Mutex::new(Some(progress_tx)));
@@ -205,17 +235,25 @@ async fn connect_and_run(
                 }
             }
 
+            Some(response) = response_rx.recv() => {
+                if write.send(Message::Text(response)).await.is_err() {
+                    warn!("[account {}] 发送 RPC 响应失败", idx);
+                }
+            }
+
             // 接收消息
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Err(e) = handle_message(
                             &text,
-                            &mut write,
                             device_id,
                             data_dir,
                             config_path,
+                            &account.proxy_token,
+                            &idx.to_string(),
                             &ctx_progress_tx,
+                            &response_tx,
                             &mut last_pong,
                         ).await {
                             warn!("[account {}] 处理消息出错: {}", idx, e);
@@ -246,20 +284,19 @@ async fn connect_and_run(
 }
 
 /// 处理收到的 WebSocket 消息
-async fn handle_message<W>(
+async fn handle_message(
     text: &str,
-    write: &mut W,
     device_id: &str,
     data_dir: &str,
     config_path: &str,
+    proxy_token: &str,
+    account_id: &str,
     progress_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<ProgressPayload>>>>,
+    response_tx: &mpsc::UnboundedSender<String>,
     last_pong: &mut Instant,
-) -> anyhow::Result<()>
-where
-    W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    let msg: serde_json::Value = serde_json::from_str(text)
-        .map_err(|e| anyhow::anyhow!("JSON 解析失败: {}", e))?;
+) -> anyhow::Result<()> {
+    let msg: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| anyhow::anyhow!("JSON 解析失败: {}", e))?;
 
     let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -270,21 +307,48 @@ where
         }
         "device_online" | "device_offline" => {
             // 设备上下线通知，记录日志即可
-            let device_name = msg.get("deviceName").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let device_name = msg
+                .get("deviceName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             info!("[relay] {}: {}", msg_type, device_name);
         }
         "rpc_request" => {
-            handle_rpc_request(&msg, write, device_id, data_dir, config_path, progress_tx).await?;
+            handle_rpc_request(
+                &msg,
+                device_id,
+                data_dir,
+                config_path,
+                proxy_token,
+                account_id,
+                progress_tx,
+                response_tx,
+            );
+        }
+        "rpc_cancel" => {
+            let run_id = msg
+                .get("runId")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if !run_id.is_empty() {
+                commands::cancel_run(account_id, run_id);
+            }
         }
         "update_available" => {
             // 后端推送的更新通知（预留：自动更新功能）
-            let version = msg.get("version").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+            let version = msg
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
             info!("[relay] 收到更新通知: v{}", version);
 
             let ctx = CommandContext {
                 device_id: device_id.to_string(),
                 data_dir: data_dir.to_string(),
                 config_path: config_path.to_string(),
+                proxy_token: proxy_token.to_string(),
+                account_id: account_id.to_string(),
                 user_id: None,
                 request_id: String::new(),
                 progress_tx: progress_tx.clone(),
@@ -303,20 +367,30 @@ where
 }
 
 /// 处理 RPC 请求
-async fn handle_rpc_request<W>(
+fn handle_rpc_request(
     msg: &serde_json::Value,
-    write: &mut W,
     device_id: &str,
     data_dir: &str,
     config_path: &str,
+    proxy_token: &str,
+    account_id: &str,
     progress_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<ProgressPayload>>>>,
-) -> anyhow::Result<()>
-where
-    W: SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
-{
-    let request_id = msg.get("requestId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let command = msg.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let params = msg.get("params").cloned().unwrap_or(serde_json::Value::Null);
+    response_tx: &mpsc::UnboundedSender<String>,
+) {
+    let request_id = msg
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let command = msg
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let params = msg
+        .get("params")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     info!("[rpc] 收到请求: {} command={}", request_id, command);
 
@@ -327,37 +401,32 @@ where
         device_id: device_id.to_string(),
         data_dir: data_dir.to_string(),
         config_path: config_path.to_string(),
+        proxy_token: proxy_token.to_string(),
+        account_id: account_id.to_string(),
         user_id,
         request_id: request_id.clone(),
         progress_tx: progress_tx.clone(),
     };
-
-    // 执行命令
-    let result = commands::dispatch(&command, &params, &ctx).await;
-
-    // 构建 rpc_response
-    let response = match result {
-        Ok(data) => serde_json::json!({
-            "type": "rpc_response",
-            "requestId": request_id,
-            "success": true,
-            "data": data,
-            "error": null,
-        }),
-        Err(err) => serde_json::json!({
-            "type": "rpc_response",
-            "requestId": request_id,
-            "success": false,
-            "data": null,
-            "error": err,
-        }),
-    };
-
-    // 发送响应
-    write.send(Message::Text(response.to_string())).await
-        .map_err(|e| anyhow::anyhow!("发送 RPC 响应失败: {}", e))?;
-
-    info!("[rpc] 请求完成: {} command={}", request_id, command);
-
-    Ok(())
+    let response_tx = response_tx.clone();
+    tokio::spawn(async move {
+        let result = commands::dispatch(&command, &params, &ctx).await;
+        let response = match result {
+            Ok(data) => serde_json::json!({
+                "type": "rpc_response",
+                "requestId": request_id,
+                "success": true,
+                "data": data,
+                "error": null,
+            }),
+            Err(err) => serde_json::json!({
+                "type": "rpc_response",
+                "requestId": request_id,
+                "success": false,
+                "data": null,
+                "error": err,
+            }),
+        };
+        let _ = response_tx.send(response.to_string());
+        info!("[rpc] 请求完成: {} command={}", request_id, command);
+    });
 }
