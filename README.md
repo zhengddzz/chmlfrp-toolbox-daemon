@@ -191,6 +191,25 @@ Daemon 支持多租户：一台服务器可同时被多个 qzhua 账号绑定。
 
 降级为 root 后，脚本会自动修补 service 文件的 `User=`/`Group=` 行，确保 systemd 服务能以 root 启动。
 
+## 远程更新机制
+
+Daemon 服务运行在 systemd 沙箱中（`ProtectSystem=strict` + `PrivateTmp` + `ReadWritePaths=/var/lib/chmlfrp-toolbox-daemon`），远程更新的执行链路专门适配了该沙箱：
+
+1. **下载**：更新包下载到数据目录 `updates/`（沙箱内唯一可写且对外可见的路径；`PrivateTmp` 使 daemon 的 `/tmp` 对沙箱外进程不可见）
+2. **安装**：通过 `systemd-run --wait --pipe --quiet` 在系统 manager 中启动 transient unit 执行 `dpkg -i` / `rpm -U`。**不能**直接 `sudo dpkg`：sudo 提权后的子进程仍处于服务的只读 mount namespace，dpkg 写 `/var/lib/dpkg` 会报 `Read-only file system`
+3. **降级链**：dpkg 失败 → `apt-get install -f` 修复依赖 → `dpkg-deb -x` 解包直接替换二进制（适配容器等无 dpkg 数据库环境）
+4. **重启**：`systemctl restart`（D-Bus 通信，不受文件系统沙箱影响）
+
+sudoers 免密规则由安装脚本生成（`/etc/sudoers.d/chmlfrp-toolbox-daemon`），规则参数顺序与 daemon 源码 `build_escalated_cmd` 逐字对应。
+
+### 常见更新故障排查
+
+| 现象 | 原因与处理 |
+|------|-----------|
+| `dpkg: unable to access the dpkg database directory /var/lib/dpkg: Read-only file system` | 旧版本（≤ v0.3.9）在沙箱内直接执行 dpkg 所致。在服务器上重新运行一键安装脚本升级到新版即可，后续更新走 systemd-run 不再复现 |
+| `sudo: a password is required` / `sudo: no tty present` | sudoers 规则缺失或参数不匹配（重新运行安装脚本），或 service 文件被改为 `NoNewPrivileges=true`（安装脚本会自动修正为 false） |
+| `Running in chroot, ignoring request` / systemd-run 报 D-Bus 错误 | 无 systemd 的容器环境。daemon 会自动回退为直接执行 dpkg；若 dpkg 数据库同样只读，再降级为解包替换二进制 |
+
 ## 从源码构建
 
 ```bash

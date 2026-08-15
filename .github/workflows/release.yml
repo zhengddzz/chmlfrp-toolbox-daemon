@@ -92,11 +92,16 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## v0.3.9 更新汇总
+            ## v0.3.10 更新汇总
 
             ### Bug 修复
-            - **服务端到客户端测速**：修复节点地址字段为空时未尝试备用地址，导致提示“无法获取节点IP”的问题。
-            - **测速错误提示**：节点接口鉴权失败、节点不存在或请求异常时，显示具体错误原因，便于排查。
+            - **远程更新安装失败（Read-only file system）**：修复服务沙箱（ProtectSystem=strict）导致 sudo 提权后 dpkg 仍无法写 /var/lib/dpkg 的问题。安装命令改为通过 systemd-run 在沙箱外以 root 执行，更新包下载路径迁移到数据目录 updates/（PrivateTmp 下 /tmp 对外部进程不可见）。
+            - **安装脚本**：修正 service 模板中 NoNewPrivileges=true 导致 sudo 完全失效的问题，并为已存在的旧 service 文件自动升级修正；sudoers 同步新增 systemd-run 免密规则。
+
+            ### 升级说明
+            - 旧版本（≤ v0.3.9）无法通过远程自动更新修复此问题，请在服务器上重新运行安装脚本完成本次升级：
+              `curl -fsSL https://api.cct.zdzz.top/chmlfrp-toolbox-daemon/install.sh | sudo bash`
+              升级完成后的后续版本可正常自动更新。
 
           files: |
             release/*.deb

@@ -1,13 +1,15 @@
 //! Daemon 更新管理 RPC 命令
 //!
 //! - check_update: 检查 u.zdzz.top 更新源是否有新版本
-//! - perform_update: 下载并安装新版本（dpkg + systemctl restart）
+//! - perform_update: 下载并安装新版本（systemd-run + dpkg + systemctl restart）
 //! - get_update_settings: 获取更新设置（自动更新开关）
 //! - set_auto_update: 设置自动更新开关
 //! - handle_update_notification: 处理后端推送的更新通知
 //!
 //! 更新源：https://u.zdzz.top/api/toolbox-daemon
 //! 进度推送：通过 ctx.progress_tx 实时推送每个步骤的日志（stage 字段携带日志文本）
+//! 安装方式：systemd-run 在沙箱外以 root 执行 dpkg（服务沙箱 ProtectSystem=strict
+//! 会使 sudo 提权后的子进程仍处于只读 mount namespace，导致 dpkg 报错）
 
 use crate::commands::{CommandContext, CommandResult, ProgressPayload, RpcError};
 use crate::config;
@@ -25,6 +27,47 @@ const APP_NAME: &str = "chmlfrp-toolbox-daemon";
 /// 获取当前 Daemon 版本
 fn get_current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// 构建 root 特权命令：优先通过 systemd-run 逃逸服务沙箱
+///
+/// 服务启用 ProtectSystem=strict 后，sudo 提权的子进程仍处于服务的
+/// 只读 mount namespace 中，dpkg 写 /var/lib/dpkg 会报
+/// "Read-only file system"。systemd-run 通过 D-Bus 在系统 manager 中
+/// 启动 transient unit，运行于系统默认 mount namespace，不受服务沙箱限制。
+/// systemd-run 不可用（无 systemd 的容器环境）时回退为直接执行。
+///
+/// 注意：参数顺序与 install.sh 生成的 sudoers 规则逐字对应，勿随意调整。
+fn build_escalated_cmd(program: &str, args: &[String], is_root: bool) -> std::process::Command {
+    let use_systemd_run = std::process::Command::new("systemd-run")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    let mut cmd = if use_systemd_run {
+        if is_root {
+            let mut c = std::process::Command::new("systemd-run");
+            c.args(["--wait", "--pipe", "--quiet", program]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sudo");
+            c.arg("-n")
+                .arg("systemd-run")
+                .args(["--wait", "--pipe", "--quiet", program]);
+            c
+        }
+    } else if is_root {
+        std::process::Command::new(program)
+    } else {
+        let mut c = std::process::Command::new("sudo");
+        c.arg("-n").arg(program);
+        c
+    };
+    cmd.args(args);
+    cmd
 }
 
 /// 异步推送进度（在 async 上下文中使用）
@@ -190,7 +233,7 @@ pub async fn check_update(_ctx: &CommandContext) -> CommandResult {
 ///
 /// 通过 ctx.progress_tx 实时推送每个步骤的详细日志。
 /// 下载使用 spawn_blocking + 分块读取，避免阻塞 tokio 运行时并支持实时进度。
-/// 安装步骤通过 sudo -n 执行（安装脚本已配置 sudoers 免密规则）。
+/// 安装步骤通过 systemd-run 在沙箱外以 root 执行（安装脚本已配置 sudoers 免密规则）。
 pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
     info!("[update] 开始执行更新流程");
 
@@ -259,8 +302,11 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
     let is_root = true;
 
     // 2. 下载安装包（分块下载 + 实时进度推送 + SHA-256 计算）
-    let tmp_dir = "/tmp";
-    let pkg_path = format!("{}/{}_update.{}", tmp_dir, APP_NAME, pkg_ext);
+    // 注意：服务启用 PrivateTmp 后，daemon 的 /tmp 对沙箱外进程不可见，
+    // 必须下载到数据目录（ReadWritePaths 声明可写，systemd-run 启动的安装进程可见）
+    let updates_dir = format!("{}/updates", ctx.data_dir.trim_end_matches('/'));
+    let _ = std::fs::create_dir_all(&updates_dir);
+    let pkg_path = format!("{}/{}_update.{}", updates_dir, APP_NAME, pkg_ext);
     let download_url_owned = download_url.to_string();
     let current_ver = get_current_version();
     let download_path = pkg_path.clone();
@@ -360,31 +406,24 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
         info!("[update] 更新源未提供 SHA-256，跳过校验");
     }
 
-    // 4. 安装（使用 sudo -n，安装脚本已配置 sudoers 免密）
+    // 4. 安装（通过 systemd-run 逃逸 ProtectSystem=strict 沙箱执行，详见 build_escalated_cmd）
     let install_cmd_desc = if is_deb { "dpkg -i" } else { "rpm -U --force" };
     send_progress(ctx, 70.0, &format!("正在安装 ({}...)...", install_cmd_desc)).await;
 
-    let mut install_cmd = if is_deb {
-        let mut cmd = if is_root {
-            std::process::Command::new("dpkg")
-        } else {
-            let mut c = std::process::Command::new("sudo");
-            c.arg("-n").arg("dpkg");
-            c
-        };
-        cmd.args(&["-i", &pkg_path]);
-        cmd
+    let install_args: Vec<String> = if is_deb {
+        vec!["-i".to_string(), pkg_path.clone()]
     } else {
-        let mut cmd = if is_root {
-            std::process::Command::new("rpm")
-        } else {
-            let mut c = std::process::Command::new("sudo");
-            c.arg("-n").arg("rpm");
-            c
-        };
-        cmd.args(&["-U", "--force", &pkg_path]);
-        cmd
+        vec![
+            "-U".to_string(),
+            "--force".to_string(),
+            pkg_path.clone(),
+        ]
     };
+    let mut install_cmd = build_escalated_cmd(
+        if is_deb { "dpkg" } else { "rpm" },
+        &install_args,
+        is_root,
+    );
 
     let output = install_cmd
         .output()
@@ -400,16 +439,11 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
             send_progress(ctx, 75.0, "安装失败，尝试修复依赖...").await;
             info!("[update] 尝试修复依赖...");
 
-            let fix_output = if is_root {
-                std::process::Command::new("apt-get")
-                    .args(&["install", "-f", "-y"])
-                    .output()
-            } else {
-                std::process::Command::new("sudo")
-                    .arg("-n")
-                    .args(&["apt-get", "install", "-f", "-y"])
-                    .output()
-            };
+            let fix_args: Vec<String> = ["install", "-f", "-y"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let fix_output = build_escalated_cmd("apt-get", &fix_args, is_root).output();
 
             let fix_ok = matches!(&fix_output, Ok(fo) if fo.status.success());
             if fix_ok && Path::new("/usr/bin").join(APP_NAME).exists() {
@@ -417,7 +451,7 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
             } else {
                 send_progress(ctx, 78.0, "修复依赖失败，尝试降级安装（解包替换二进制）...").await;
                 info!("[update] 依赖修复失败，降级为手动解压安装...");
-                match manual_install_deb(&pkg_path, is_root) {
+                match manual_install_deb(&pkg_path, &updates_dir, is_root) {
                     Ok(()) => {
                         send_progress(ctx, 85.0, "降级安装成功").await;
                     }
@@ -519,16 +553,17 @@ pub async fn set_auto_update(params: &serde_json::Value, ctx: &CommandContext) -
 /// dpkg 失败时的降级安装：dpkg-deb -x 解包 + install 直接替换二进制
 ///
 /// 适用于容器/受限环境（/var/lib/dpkg 只读导致 dpkg -i 无法写数据库）。
-/// dpkg-deb 只读取包文件并解压到 /tmp（daemon 用户可直接执行，无需 sudo）；
-/// 复制二进制到 /usr/bin 需要 root（sudo -n install，install.sh 已配置 sudoers 免密）。
-fn manual_install_deb(pkg_path: &str, is_root: bool) -> Result<(), String> {
-    let extract_dir = "/tmp/chmlfrp-toolbox-daemon_extract";
-    let _ = std::fs::remove_dir_all(extract_dir);
-    std::fs::create_dir_all(extract_dir).map_err(|e| format!("创建解压目录失败: {}", e))?;
+/// 解包目录必须位于数据目录（updates_base）：PrivateTmp 沙箱使 daemon 的
+/// /tmp 对沙箱外进程不可见，而复制二进制到 /usr/bin 需要 systemd-run
+/// 在沙箱外以 root 执行（sudoers 已配置免密规则）。
+fn manual_install_deb(pkg_path: &str, updates_base: &str, is_root: bool) -> Result<(), String> {
+    let extract_dir = format!("{}/extract", updates_base);
+    let _ = std::fs::remove_dir_all(&extract_dir);
+    std::fs::create_dir_all(&extract_dir).map_err(|e| format!("创建解压目录失败: {}", e))?;
 
     // 1. 解包（无需写 dpkg 数据库）
     let extract_out = std::process::Command::new("dpkg-deb")
-        .args(["-x", pkg_path, extract_dir])
+        .args(["-x", pkg_path, &extract_dir])
         .output()
         .map_err(|e| format!("执行 dpkg-deb 失败: {}", e))?;
     if !extract_out.status.success() {
@@ -562,18 +597,14 @@ fn manual_install_deb(pkg_path: &str, is_root: bool) -> Result<(), String> {
 
     let mut last_err = String::new();
     for dest in &dest_candidates {
-        let mut cmd = if is_root {
-            let mut c = std::process::Command::new("install");
-            c.args(["-m", "755", &bin_src, dest]);
-            c
-        } else {
-            let mut c = std::process::Command::new("sudo");
-            c.arg("-n")
-                .arg("install")
-                .args(["-m", "755", &bin_src, dest]);
-            c
-        };
-        match cmd.output() {
+        let install_args: Vec<String> = [
+            "-m".to_string(),
+            "755".to_string(),
+            bin_src.clone(),
+            dest.clone(),
+        ]
+        .to_vec();
+        match build_escalated_cmd("install", &install_args, is_root).output() {
             Ok(out) if out.status.success() => {
                 info!("[update] 降级安装完成，二进制已替换到 {}", dest);
                 let _ = std::fs::remove_dir_all(extract_dir);
@@ -594,9 +625,9 @@ fn manual_install_deb(pkg_path: &str, is_root: bool) -> Result<(), String> {
         }
     }
 
-    let _ = std::fs::remove_dir_all(extract_dir);
+    let _ = std::fs::remove_dir_all(&extract_dir);
     Err(format!(
-        "降级安装失败：{}（sudoers 可能缺少 install 规则，请重新运行安装脚本）",
+        "降级安装失败：{}（sudoers 可能缺少 systemd-run install 规则，请重新运行安装脚本）",
         last_err
     ))
 }

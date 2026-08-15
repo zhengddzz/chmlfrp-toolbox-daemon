@@ -163,11 +163,21 @@ setup_sudoers() {
 # ${APP_NAME} - 允许 daemon 用户免密执行更新所需的特权命令
 # 由安装脚本自动生成，请勿手动修改
 
+# ===== systemd-run 方式（v0.3.10+ 主路径）=====
+# 服务沙箱 ProtectSystem=strict 使 sudo 提权后的子进程仍处于只读
+# mount namespace，dpkg 直写 /var/lib/dpkg 会报 Read-only file system。
+# systemd-run 在系统 manager 中启动 transient unit，于沙箱外执行安装。
+# 注意：参数顺序与 daemon 源码 build_escalated_cmd 逐字对应，勿调整。
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet dpkg -i ${DATA_DIR}/updates/${APP_NAME}_update.deb
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet rpm -U --force ${DATA_DIR}/updates/${APP_NAME}_update.rpm
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet apt-get install -f -y
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet install -m 755 ${DATA_DIR}/updates/extract/usr/bin/${APP_NAME} /usr/bin/${APP_NAME}
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet install -m 755 ${DATA_DIR}/updates/extract/usr/bin/${APP_NAME} /usr/local/bin/${APP_NAME}
+
+# ===== 直接执行方式（旧版兼容 / 无 systemd 环境回退）=====
 # dpkg 安装更新包
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/dpkg -i /tmp/${APP_NAME}_update.deb
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/dpkg -i /tmp/${APP_NAME}_update.rpm
-# apt-get 修复依赖
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/apt-get install -f -y
 # rpm 安装更新包
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/rpm -U --force /tmp/${APP_NAME}_update.rpm
 # install 降级安装更新包（容器/受限环境下 dpkg 数据库只读时，解包直接替换二进制）
@@ -227,13 +237,16 @@ Wants=network-online.target
 Type=simple
 User=${APP_USER}
 Group=${APP_GROUP}
+SupplementaryGroups=systemd-journal
 ExecStart=${INSTALL_DIR}/${APP_NAME} --config ${CONFIG_FILE} start
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-NoNewPrivileges=true
+# NoNewPrivileges 必须为 false：更新流程依赖 sudo 提权，
+# true 会禁用 setuid 导致 sudo 失效（远程更新无法安装）
+NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=${DATA_DIR}
@@ -270,6 +283,15 @@ EOF
         if $changed; then
             info "已调整 service 配置（运行用户: root，路径: $INSTALL_DIR）"
         fi
+    fi
+
+    # 升级旧版配置：NoNewPrivileges=true 会导致 sudo 提权失效（远程更新无法安装）
+    if grep -q '^NoNewPrivileges=true' "$SERVICE_FILE" 2>/dev/null; then
+        sed -i 's|^NoNewPrivileges=true|NoNewPrivileges=false|' "$SERVICE_FILE" 2>/dev/null
+        if command -v systemctl &>/dev/null; then
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+        info "已修正 service 配置: NoNewPrivileges=false（否则 sudo 无法提权）"
     fi
 }
 
