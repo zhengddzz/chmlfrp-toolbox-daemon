@@ -288,7 +288,8 @@ fn stop_e2e_tcp_server() {
 
 #[cfg(test)]
 mod speed_protocol_tests {
-    use super::parse_speed_request;
+    use super::{parse_node_address, parse_speed_request};
+    use serde_json::json;
     use std::time::Duration;
 
     #[test]
@@ -304,6 +305,36 @@ mod speed_protocol_tests {
         assert!(parse_speed_request("SPEEDTEST_TIME 4000\n").is_err());
         assert!(parse_speed_request("SPEEDTEST_TIME 121000\n").is_err());
     }
+
+    #[test]
+    fn falls_back_when_primary_node_address_is_null_or_blank() {
+        assert_eq!(
+            parse_node_address(&json!({ "ip": null, "realIp": "1.2.3.4" })).unwrap(),
+            "1.2.3.4"
+        );
+        assert_eq!(
+            parse_node_address(&json!({ "ip": "  ", "real_IP": "node.example.com" })).unwrap(),
+            "node.example.com"
+        );
+    }
+
+    #[test]
+    fn reports_missing_node_address_clearly() {
+        assert_eq!(
+            parse_node_address(&json!({ "ip": null, "realIp": "" })).unwrap_err(),
+            "节点信息中缺少可用地址"
+        );
+    }
+}
+
+fn parse_node_address(node_data: &serde_json::Value) -> Result<String, String> {
+    ["ip", "realIp", "real_IP"]
+        .iter()
+        .filter_map(|key| node_data.get(key).and_then(|value| value.as_str()))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "节点信息中缺少可用地址".to_string())
 }
 
 /// 调用 chmlfrp API 创建临时隧道
@@ -327,20 +358,37 @@ async fn create_temp_tunnel(
         .await
         .map_err(|e| format!("获取节点信息失败: {}", e))?;
 
+    let node_status = node_resp.status();
+
     let node_data: serde_json::Value = node_resp
         .json()
         .await
         .map_err(|e| format!("解析节点信息失败: {}", e))?;
 
-    let node_data = node_data.get("data").unwrap_or(&node_data);
+    if !node_status.is_success() {
+        let msg = node_data
+            .get("msg")
+            .and_then(|value| value.as_str())
+            .unwrap_or("未知错误");
+        return Err(format!("获取节点信息失败（HTTP {}）: {}", node_status, msg));
+    }
 
-    let node_ip = node_data
-        .get("ip")
-        .or_else(|| node_data.get("realIp"))
-        .or_else(|| node_data.get("real_IP"))
-        .and_then(|v| v.as_str())
-        .ok_or("无法获取节点IP")?
-        .to_string();
+    if let Some(code) = node_data.get("code").and_then(|value| value.as_i64()) {
+        if code != 200 {
+            let msg = node_data
+                .get("msg")
+                .and_then(|value| value.as_str())
+                .unwrap_or("未知错误");
+            return Err(format!("获取节点信息失败（业务码 {}）: {}", code, msg));
+        }
+    }
+
+    let node_data = node_data
+        .get("data")
+        .filter(|value| value.is_object())
+        .unwrap_or(&node_data);
+
+    let node_ip = parse_node_address(node_data)?;
 
     let rport_str = node_data
         .get("rport")
