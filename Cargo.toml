@@ -1,6 +1,6 @@
 [package]
 name = "chmlfrp-toolbox-daemon"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 description = "ChmlFrp 社区工具箱 Daemon - 服务器端远程管理守护进程"
 license = "MIT"
@@ -29,6 +29,8 @@ clap = { version = "4", features = ["derive"] }
 # 日志
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# 滚动文件日志（按天滚动，配合自动清理）
+tracing-appender = "0.2"
 # UUID 生成
 uuid = { version = "1", features = ["v4"] }
 # 系统信息

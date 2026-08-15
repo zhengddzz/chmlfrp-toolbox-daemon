@@ -6,6 +6,13 @@
 backend_url = "wss://api.cct.zdzz.top"
 data_dir = "/var/lib/chmlfrp-toolbox-daemon"
 
+[update]
+auto_update = false
+
+[log]
+# 日志文件保留天数（超过自动删除，0 表示永不清理）
+retention_days = 7
+
 [[accounts]]
 proxy_token = "在此填入你的_proxyToken"
 device_name = "我的服务器"

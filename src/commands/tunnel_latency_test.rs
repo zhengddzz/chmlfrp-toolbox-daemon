@@ -32,7 +32,7 @@ struct TunnelLatencyResult {
     loss_percent: f64,
     sent: usize,
     received: usize,
-    rtts: Vec<f64>,
+    rtts: Vec<Option<f64>>,
     error: Option<String>,
 }
 
@@ -57,7 +57,7 @@ fn calculate_latency_stats(samples: &[Option<f64>]) -> Result<TunnelLatencyResul
         loss_percent: (samples.len() - rtts.len()) as f64 / samples.len() as f64 * 100.0,
         sent: samples.len(),
         received: rtts.len(),
-        rtts,
+        rtts: samples.to_vec(),
         error: None,
     })
 }

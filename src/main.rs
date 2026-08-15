@@ -6,13 +6,13 @@
 mod commands;
 mod config;
 mod db;
+mod logs;
 mod relay;
 mod telemetry;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing::{info, Level};
-use tracing_subscriber::EnvFilter;
+use tracing::info;
 
 /// ChmlFrp 社区工具箱 Daemon
 #[derive(Parser)]
@@ -47,19 +47,16 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // 初始化日志
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
-
     let cli = Cli::parse();
 
     match cli.command {
         Command::Start => {
             let cfg = config::load_config(&cli.config)?;
+
+            // 初始化日志：stdout + 按天滚动文件（data_dir/logs/daemon.log.*）
+            // guard 必须保活到进程退出，drop 后文件日志停止写入
+            let _log_guard = logs::init_tracing(Some(&cfg.server.data_dir));
+
             info!("ChmlFrp 工具箱 Daemon 启动中...");
             info!("配置文件: {}", cli.config.display());
             info!("后端地址: {}", cfg.server.backend_url);
@@ -68,11 +65,16 @@ async fn main() -> anyhow::Result<()> {
             // 初始化数据库目录
             db::init_db_dir(&cfg.server.data_dir)?;
 
+            // 日志自动清理：删除超过保留天数的日志文件（每天执行一次）
+            logs::start_cleanup_task(cfg.server.data_dir.clone(), cfg.log.retention_days);
+
             // 启动 relay 客户端（多租户，每个 token 一个连接）
             let config_path = cli.config.to_string_lossy().to_string();
             relay::run_multi_tenant(cfg, config_path).await?;
         }
         Command::Status => {
+            // 无 data_dir 可用，仅输出到 stdout
+            let _log_guard = logs::init_tracing(None);
             let cfg = config::load_config(&cli.config)?;
             info!("配置文件: {}", cli.config.display());
             info!("后端地址: {}", cfg.server.backend_url);
@@ -81,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Daemon 状态查询功能待实现（需通过本地管理 socket）");
         }
         Command::InitConfig { output } => {
+            let _log_guard = logs::init_tracing(None);
             config::generate_template(&output)?;
             info!("配置模板已生成: {}", output.display());
             println!("请编辑 {} 添加你的账号 token", output.display());

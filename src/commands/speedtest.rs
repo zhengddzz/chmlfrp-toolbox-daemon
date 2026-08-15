@@ -4,8 +4,8 @@
 //! 通过 progress_tx 推送实时进度。
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -43,7 +43,13 @@ struct SpeedtestResult {
 }
 
 /// 发送进度推送
-async fn send_progress(ctx: &super::CommandContext, request_id: &str, progress: f64, stage: &str, speed_mbps: f64) {
+async fn send_progress(
+    ctx: &super::CommandContext,
+    request_id: &str,
+    progress: f64,
+    stage: &str,
+    speed_mbps: f64,
+) {
     let tx = ctx.progress_tx.lock().await;
     if let Some(sender) = tx.as_ref() {
         let _ = sender.send(super::ProgressPayload {
@@ -81,10 +87,11 @@ pub async fn handle(
         "download" | "both" => {
             run_download(&p.url, duration_secs, cancel_flag.clone(), ctx, &request_id).await
         }
-        "upload" => {
-            run_upload(&p.url, duration_secs, cancel_flag.clone(), ctx, &request_id).await
-        }
-        _ => Err(format!("不支持的方向: {}（可选 download/upload/both）", p.direction)),
+        "upload" => run_upload(&p.url, duration_secs, cancel_flag.clone(), ctx, &request_id).await,
+        _ => Err(format!(
+            "不支持的方向: {}（可选 download/upload/both）",
+            p.direction
+        )),
     };
 
     timeout_handle.abort();

@@ -1,9 +1,10 @@
 //! Daemon 服务控制与日志 RPC 命令
 //!
 //! - service_control: 启动/停止/重启/查询状态
-//! - get_logs: 获取最近日志（journalctl）
+//! - get_logs: 获取最近日志（优先读取滚动文件日志，回退 journalctl）
 
 use crate::commands::{CommandContext, CommandResult, RpcError};
+use crate::logs;
 use serde::Deserialize;
 
 const APP_NAME: &str = "chmlfrp-toolbox-daemon";
@@ -56,7 +57,12 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
             // 客户端需要在收到响应后等待重连
             let output = build_systemctl_cmd(&["restart", APP_NAME])
                 .output()
-                .map_err(|e| RpcError::new("SERVICE_CONTROL_FAILED", format!("执行 systemctl 失败: {}", e)))?;
+                .map_err(|e| {
+                    RpcError::new(
+                        "SERVICE_CONTROL_FAILED",
+                        format!("执行 systemctl 失败: {}", e),
+                    )
+                })?;
 
             if output.status.success() {
                 Ok(serde_json::json!({
@@ -65,13 +71,21 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
                 }))
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(RpcError::new("SERVICE_CONTROL_FAILED", format!("重启失败: {}", stderr)))
+                Err(RpcError::new(
+                    "SERVICE_CONTROL_FAILED",
+                    format!("重启失败: {}", stderr),
+                ))
             }
         }
         "stop" => {
             let output = build_systemctl_cmd(&["stop", APP_NAME])
                 .output()
-                .map_err(|e| RpcError::new("SERVICE_CONTROL_FAILED", format!("执行 systemctl 失败: {}", e)))?;
+                .map_err(|e| {
+                    RpcError::new(
+                        "SERVICE_CONTROL_FAILED",
+                        format!("执行 systemctl 失败: {}", e),
+                    )
+                })?;
 
             if output.status.success() {
                 Ok(serde_json::json!({
@@ -80,14 +94,22 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
                 }))
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(RpcError::new("SERVICE_CONTROL_FAILED", format!("停止失败: {}", stderr)))
+                Err(RpcError::new(
+                    "SERVICE_CONTROL_FAILED",
+                    format!("停止失败: {}", stderr),
+                ))
             }
         }
         "start" => {
             // 启动服务（通常在 stop 后使用）
             let output = build_systemctl_cmd(&["start", APP_NAME])
                 .output()
-                .map_err(|e| RpcError::new("SERVICE_CONTROL_FAILED", format!("执行 systemctl 失败: {}", e)))?;
+                .map_err(|e| {
+                    RpcError::new(
+                        "SERVICE_CONTROL_FAILED",
+                        format!("执行 systemctl 失败: {}", e),
+                    )
+                })?;
 
             if output.status.success() {
                 Ok(serde_json::json!({
@@ -96,10 +118,16 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
                 }))
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(RpcError::new("SERVICE_CONTROL_FAILED", format!("启动失败: {}", stderr)))
+                Err(RpcError::new(
+                    "SERVICE_CONTROL_FAILED",
+                    format!("启动失败: {}", stderr),
+                ))
             }
         }
-        other => Err(RpcError::new("INVALID_PARAMS", format!("不支持的操作: {}（支持 start/stop/restart/status）", other))),
+        other => Err(RpcError::new(
+            "INVALID_PARAMS",
+            format!("不支持的操作: {}（支持 start/stop/restart/status）", other),
+        )),
     }
 }
 
@@ -144,12 +172,23 @@ pub struct GetLogsParams {
     pub lines: Option<usize>,
 }
 
-pub async fn get_logs(params: &serde_json::Value, _ctx: &CommandContext) -> CommandResult {
-    let p: GetLogsParams = serde_json::from_value(params.clone())
-        .unwrap_or(GetLogsParams { lines: None });
+pub async fn get_logs(params: &serde_json::Value, ctx: &CommandContext) -> CommandResult {
+    let p: GetLogsParams =
+        serde_json::from_value(params.clone()).unwrap_or(GetLogsParams { lines: None });
 
     let lines = p.lines.unwrap_or(50).min(500);
 
+    // 优先读取滚动文件日志（data_dir/logs/daemon.log.*，自动清理只作用于文件）
+    if let Some(file_logs) = logs::read_file_logs(&logs::log_dir(&ctx.data_dir), lines) {
+        return Ok(serde_json::json!({
+            "success": true,
+            "logs": file_logs,
+            "lines": lines,
+            "source": "file",
+        }));
+    }
+
+    // 回退 journalctl（文件日志尚未生成时，例如刚升级到带文件日志的版本）
     let output = std::process::Command::new("journalctl")
         .args(&["-u", APP_NAME, "--no-pager", "-n", &lines.to_string()])
         .output()

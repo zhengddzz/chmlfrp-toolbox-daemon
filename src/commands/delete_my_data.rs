@@ -1,7 +1,7 @@
 //! delete_my_data 命令 - 删除当前用户在本设备上的所有数据
 
-use tracing::info;
 use super::CommandContext;
+use tracing::info;
 
 pub async fn handle(ctx: &CommandContext) -> super::CommandResult {
     let user_id = match ctx.user_id {

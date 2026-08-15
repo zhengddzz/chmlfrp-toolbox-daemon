@@ -170,6 +170,9 @@ ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/dpkg -i /tmp/${APP_NAME}_update.rpm
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/apt-get install -f -y
 # rpm 安装更新包
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/rpm -U --force /tmp/${APP_NAME}_update.rpm
+# install 降级安装更新包（容器/受限环境下 dpkg 数据库只读时，解包直接替换二进制）
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/install -m 755 /tmp/${APP_NAME}_extract/usr/bin/${APP_NAME} /usr/bin/${APP_NAME}
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/install -m 755 /tmp/${APP_NAME}_extract/usr/bin/${APP_NAME} /usr/local/bin/${APP_NAME}
 # systemctl 服务控制（start/stop/restart）
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${APP_NAME}
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${APP_NAME}.service

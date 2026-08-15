@@ -70,11 +70,10 @@ pub async fn check_update(_ctx: &CommandContext) -> CommandResult {
         .build()
         .map_err(|e| RpcError::new("HTTP_CLIENT_FAILED", e.to_string()))?;
 
-    let resp = client
-        .get(UPDATE_API)
-        .send()
-        .await
-        .map_err(|e| RpcError::new("FETCH_UPDATE_FAILED", format!("获取更新信息失败: {}", e)))?;
+    let resp =
+        client.get(UPDATE_API).send().await.map_err(|e| {
+            RpcError::new("FETCH_UPDATE_FAILED", format!("获取更新信息失败: {}", e))
+        })?;
 
     if !resp.status().is_success() {
         return Err(RpcError::new(
@@ -129,42 +128,46 @@ pub async fn check_update(_ctx: &CommandContext) -> CommandResult {
     let (download_url, sha256) = linux_packages
         .and_then(|packages| {
             // 第一轮：精确匹配架构 + deb 格式
-            packages.iter().find_map(|pkg| {
-                let format = pkg.get("format").and_then(|v| v.as_str())?;
-                let pkg_arch = pkg.get("arch").and_then(|v| v.as_str()).unwrap_or("");
-                let url = pkg.get("url").and_then(|v| v.as_str())?;
-                let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-                if format == "deb" && pkg_arch == arch_key {
-                    Some((url.to_string(), hash.to_string()))
-                } else {
-                    None
-                }
-            }).or_else(|| {
-                // 第二轮：精确匹配架构 + rpm 格式
-                packages.iter().find_map(|pkg| {
+            packages
+                .iter()
+                .find_map(|pkg| {
                     let format = pkg.get("format").and_then(|v| v.as_str())?;
                     let pkg_arch = pkg.get("arch").and_then(|v| v.as_str()).unwrap_or("");
                     let url = pkg.get("url").and_then(|v| v.as_str())?;
                     let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-                    if format == "rpm" && pkg_arch == arch_key {
+                    if format == "deb" && pkg_arch == arch_key {
                         Some((url.to_string(), hash.to_string()))
                     } else {
                         None
                     }
                 })
-            }).or_else(|| {
-                // 第三轮：任意架构 + deb 格式
-                packages.iter().find_map(|pkg| {
-                    let format = pkg.get("format").and_then(|v| v.as_str())?;
-                    let url = pkg.get("url").and_then(|v| v.as_str())?;
-                    let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-                    if format == "deb" {
-                        Some((url.to_string(), hash.to_string()))
-                    } else {
-                        None
-                    }
+                .or_else(|| {
+                    // 第二轮：精确匹配架构 + rpm 格式
+                    packages.iter().find_map(|pkg| {
+                        let format = pkg.get("format").and_then(|v| v.as_str())?;
+                        let pkg_arch = pkg.get("arch").and_then(|v| v.as_str()).unwrap_or("");
+                        let url = pkg.get("url").and_then(|v| v.as_str())?;
+                        let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+                        if format == "rpm" && pkg_arch == arch_key {
+                            Some((url.to_string(), hash.to_string()))
+                        } else {
+                            None
+                        }
+                    })
                 })
-            })
+                .or_else(|| {
+                    // 第三轮：任意架构 + deb 格式
+                    packages.iter().find_map(|pkg| {
+                        let format = pkg.get("format").and_then(|v| v.as_str())?;
+                        let url = pkg.get("url").and_then(|v| v.as_str())?;
+                        let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+                        if format == "deb" {
+                            Some((url.to_string(), hash.to_string()))
+                        } else {
+                            None
+                        }
+                    })
+                })
         })
         .unwrap_or_default();
 
@@ -225,15 +228,29 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
 
     if download_url.is_empty() {
         send_progress(ctx, 100.0, "未找到适合当前架构的安装包").await;
-        return Err(RpcError::new("NO_DOWNLOAD_URL", "未找到适合当前架构的安装包"));
+        return Err(RpcError::new(
+            "NO_DOWNLOAD_URL",
+            "未找到适合当前架构的安装包",
+        ));
     }
 
-    send_progress(ctx, 10.0, &format!("发现新版本 v{}，准备下载...", latest_version)).await;
+    send_progress(
+        ctx,
+        10.0,
+        &format!("发现新版本 v{}，准备下载...", latest_version),
+    )
+    .await;
 
     // 判断包格式（deb 或 rpm）
     let is_deb = download_url.ends_with(".deb");
     let is_rpm = download_url.ends_with(".rpm");
-    let pkg_ext = if is_deb { "deb" } else if is_rpm { "rpm" } else { "deb" };
+    let pkg_ext = if is_deb {
+        "deb"
+    } else if is_rpm {
+        "rpm"
+    } else {
+        "deb"
+    };
 
     // 当前用户是否为 root（root 不需要 sudo）
     #[cfg(unix)]
@@ -252,67 +269,76 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
 
     send_progress(ctx, 15.0, &format!("正在下载 {} 安装包...", pkg_ext)).await;
 
-    let download_result = tokio::task::spawn_blocking(move || -> Result<(usize, String), String> {
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(format!("{}/{}", APP_NAME, current_ver))
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| format!("HTTP 客户端构建失败: {}", e))?;
+    let download_result =
+        tokio::task::spawn_blocking(move || -> Result<(usize, String), String> {
+            let client = reqwest::blocking::Client::builder()
+                .user_agent(format!("{}/{}", APP_NAME, current_ver))
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+                .map_err(|e| format!("HTTP 客户端构建失败: {}", e))?;
 
-        let mut resp = client
-            .get(&download_url_owned)
-            .send()
-            .map_err(|e| format!("下载安装包失败: {}", e))?;
+            let mut resp = client
+                .get(&download_url_owned)
+                .send()
+                .map_err(|e| format!("下载安装包失败: {}", e))?;
 
-        if !resp.status().is_success() {
-            return Err(format!("下载返回: {}", resp.status()));
-        }
-
-        let total_size = resp.content_length().unwrap_or(0);
-        let mut file = std::fs::File::create(&download_path)
-            .map_err(|e| format!("创建临时文件失败: {}", e))?;
-
-        let mut downloaded: u64 = 0;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 65536]; // 64KB 缓冲区
-        loop {
-            let n = resp
-                .read(&mut buffer)
-                .map_err(|e| format!("读取数据失败: {}", e))?;
-            if n == 0 {
-                break;
+            if !resp.status().is_success() {
+                return Err(format!("下载返回: {}", resp.status()));
             }
-            file.write_all(&buffer[..n])
-                .map_err(|e| format!("写入文件失败: {}", e))?;
-            hasher.update(&buffer[..n]);
-            downloaded += n as u64;
-            if total_size > 0 {
-                let pct = 15.0 + (downloaded as f64 / total_size as f64) * 35.0; // 15-50
-                let size_mb = downloaded as f64 / 1024.0 / 1024.0;
-                let total_mb = total_size as f64 / 1024.0 / 1024.0;
-                push_progress(
-                    &progress_tx,
-                    &request_id,
-                    pct,
-                    &format!("下载中... {:.1}/{:.1} MB ({:.0}%)", size_mb, total_mb, (pct - 15.0) / 35.0 * 100.0),
-                );
+
+            let total_size = resp.content_length().unwrap_or(0);
+            let mut file = std::fs::File::create(&download_path)
+                .map_err(|e| format!("创建临时文件失败: {}", e))?;
+
+            let mut downloaded: u64 = 0;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 65536]; // 64KB 缓冲区
+            loop {
+                let n = resp
+                    .read(&mut buffer)
+                    .map_err(|e| format!("读取数据失败: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..n])
+                    .map_err(|e| format!("写入文件失败: {}", e))?;
+                hasher.update(&buffer[..n]);
+                downloaded += n as u64;
+                if total_size > 0 {
+                    let pct = 15.0 + (downloaded as f64 / total_size as f64) * 35.0; // 15-50
+                    let size_mb = downloaded as f64 / 1024.0 / 1024.0;
+                    let total_mb = total_size as f64 / 1024.0 / 1024.0;
+                    push_progress(
+                        &progress_tx,
+                        &request_id,
+                        pct,
+                        &format!(
+                            "下载中... {:.1}/{:.1} MB ({:.0}%)",
+                            size_mb,
+                            total_mb,
+                            (pct - 15.0) / 35.0 * 100.0
+                        ),
+                    );
+                }
             }
-        }
 
-        let sha256_hash = hasher.finalize();
-        let sha256_hex = format!("{:x}", sha256_hash);
+            let sha256_hash = hasher.finalize();
+            let sha256_hex = format!("{:x}", sha256_hash);
 
-        Ok((downloaded as usize, sha256_hex))
-    })
-    .await
-    .map_err(|e| RpcError::new("DOWNLOAD_FAILED", format!("下载任务异常: {}", e)))?;
+            Ok((downloaded as usize, sha256_hex))
+        })
+        .await
+        .map_err(|e| RpcError::new("DOWNLOAD_FAILED", format!("下载任务异常: {}", e)))?;
 
-    let (downloaded_bytes, actual_sha256) = download_result
-        .map_err(|e| RpcError::new("DOWNLOAD_FAILED", e))?;
+    let (downloaded_bytes, actual_sha256) =
+        download_result.map_err(|e| RpcError::new("DOWNLOAD_FAILED", e))?;
 
     let size_kb = downloaded_bytes / 1024;
     send_progress(ctx, 55.0, &format!("下载完成，大小: {} KB", size_kb)).await;
-    info!("[update] 安装包已下载: {} ({} bytes)", pkg_path, downloaded_bytes);
+    info!(
+        "[update] 安装包已下载: {} ({} bytes)",
+        pkg_path, downloaded_bytes
+    );
 
     // 3. SHA-256 校验
     if !expected_sha256.is_empty() {
@@ -369,7 +395,7 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
         let stdout = String::from_utf8_lossy(&output.stdout);
         warn!("[update] 安装失败: stderr={}, stdout={}", stderr, stdout);
 
-        // deb 包尝试自动修复依赖
+        // deb 包尝试自动修复依赖；仍失败则降级为解包直接替换二进制（容器/受限环境）
         if is_deb {
             send_progress(ctx, 75.0, "安装失败，尝试修复依赖...").await;
             info!("[update] 尝试修复依赖...");
@@ -385,22 +411,29 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
                     .output()
             };
 
-            if let Ok(fo) = fix_output {
-                if !fo.status.success() {
-                    let _ = std::fs::remove_file(&pkg_path);
-                    send_progress(ctx, 100.0, &format!("安装失败: {}", stderr.trim())).await;
-                    return Err(RpcError::new(
-                        "INSTALL_FAILED",
-                        format!("dpkg 安装失败且依赖修复失败: {}", stderr),
-                    ));
-                }
+            let fix_ok = matches!(&fix_output, Ok(fo) if fo.status.success());
+            if fix_ok && Path::new("/usr/bin").join(APP_NAME).exists() {
+                // 依赖修复成功且二进制已就位
             } else {
-                let _ = std::fs::remove_file(&pkg_path);
-                send_progress(ctx, 100.0, &format!("安装失败: {}", stderr.trim())).await;
-                return Err(RpcError::new(
-                    "INSTALL_FAILED",
-                    format!("dpkg 安装失败: {}", stderr),
-                ));
+                send_progress(ctx, 78.0, "修复依赖失败，尝试降级安装（解包替换二进制）...").await;
+                info!("[update] 依赖修复失败，降级为手动解压安装...");
+                match manual_install_deb(&pkg_path, is_root) {
+                    Ok(()) => {
+                        send_progress(ctx, 85.0, "降级安装成功").await;
+                    }
+                    Err(manual_err) => {
+                        let _ = std::fs::remove_file(&pkg_path);
+                        send_progress(ctx, 100.0, &format!("安装失败: {}", manual_err)).await;
+                        return Err(RpcError::new(
+                            "INSTALL_FAILED",
+                            format!(
+                                "dpkg 安装失败（{}）且降级安装失败: {}",
+                                stderr.trim(),
+                                manual_err
+                            ),
+                        ));
+                    }
+                }
             }
         } else {
             let _ = std::fs::remove_file(&pkg_path);
@@ -483,13 +516,95 @@ pub async fn set_auto_update(params: &serde_json::Value, ctx: &CommandContext) -
     }))
 }
 
+/// dpkg 失败时的降级安装：dpkg-deb -x 解包 + install 直接替换二进制
+///
+/// 适用于容器/受限环境（/var/lib/dpkg 只读导致 dpkg -i 无法写数据库）。
+/// dpkg-deb 只读取包文件并解压到 /tmp（daemon 用户可直接执行，无需 sudo）；
+/// 复制二进制到 /usr/bin 需要 root（sudo -n install，install.sh 已配置 sudoers 免密）。
+fn manual_install_deb(pkg_path: &str, is_root: bool) -> Result<(), String> {
+    let extract_dir = "/tmp/chmlfrp-toolbox-daemon_extract";
+    let _ = std::fs::remove_dir_all(extract_dir);
+    std::fs::create_dir_all(extract_dir).map_err(|e| format!("创建解压目录失败: {}", e))?;
+
+    // 1. 解包（无需写 dpkg 数据库）
+    let extract_out = std::process::Command::new("dpkg-deb")
+        .args(["-x", pkg_path, extract_dir])
+        .output()
+        .map_err(|e| format!("执行 dpkg-deb 失败: {}", e))?;
+    if !extract_out.status.success() {
+        return Err(format!(
+            "dpkg-deb 解包失败: {}",
+            String::from_utf8_lossy(&extract_out.stderr)
+        ));
+    }
+
+    // 2. 复制二进制
+    // 目标优先级：当前运行的二进制路径（保证与 systemd ExecStart 一致，重启后新版本生效）
+    // → /usr/bin → /usr/local/bin
+    let bin_src = format!("{}/usr/bin/{}", extract_dir, APP_NAME);
+    if !Path::new(&bin_src).exists() {
+        return Err(format!("deb 包中未找到二进制文件 usr/bin/{}", APP_NAME));
+    }
+
+    let mut dest_candidates: Vec<String> = Vec::new();
+    if let Ok(exe) = std::fs::read_link("/proc/self/exe") {
+        let exe_str = exe.to_string_lossy().to_string();
+        if exe_str.ends_with(APP_NAME) {
+            dest_candidates.push(exe_str);
+        }
+    }
+    for dir in ["/usr/bin", "/usr/local/bin"] {
+        let p = format!("{}/{}", dir, APP_NAME);
+        if !dest_candidates.contains(&p) {
+            dest_candidates.push(p);
+        }
+    }
+
+    let mut last_err = String::new();
+    for dest in &dest_candidates {
+        let mut cmd = if is_root {
+            let mut c = std::process::Command::new("install");
+            c.args(["-m", "755", &bin_src, dest]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sudo");
+            c.arg("-n")
+                .arg("install")
+                .args(["-m", "755", &bin_src, dest]);
+            c
+        };
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                info!("[update] 降级安装完成，二进制已替换到 {}", dest);
+                let _ = std::fs::remove_dir_all(extract_dir);
+                return Ok(());
+            }
+            Ok(out) => {
+                last_err = format!(
+                    "写入 {} 失败: {}",
+                    dest,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                warn!("[update] 降级安装 {}", last_err);
+            }
+            Err(e) => {
+                last_err = format!("写入 {} 失败: {}", dest, e);
+                warn!("[update] 降级安装 {}", last_err);
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(extract_dir);
+    Err(format!(
+        "降级安装失败：{}（sudoers 可能缺少 install 规则，请重新运行安装脚本）",
+        last_err
+    ))
+}
+
 /// 比较版本号：返回 true 表示 v1 > v2
 fn version_gt(v1: &str, v2: &str) -> bool {
-    let parse = |s: &str| -> Vec<u32> {
-        s.split('.')
-            .filter_map(|p| p.parse::<u32>().ok())
-            .collect()
-    };
+    let parse =
+        |s: &str| -> Vec<u32> { s.split('.').filter_map(|p| p.parse::<u32>().ok()).collect() };
     let a = parse(v1);
     let b = parse(v2);
     for i in 0..a.len().max(b.len()) {
@@ -514,7 +629,10 @@ pub async fn handle_update_notification(ctx: &CommandContext, version: &str) {
     let auto_update = config::get_effective_auto_update(path, &ctx.data_dir);
 
     if auto_update {
-        info!("[update] 收到更新通知 v{}，自动更新已开启，开始执行更新...", version);
+        info!(
+            "[update] 收到更新通知 v{}，自动更新已开启，开始执行更新...",
+            version
+        );
         if let Err(e) = perform_update(ctx).await {
             warn!("[update] 自动更新失败: {}", e.message);
         }

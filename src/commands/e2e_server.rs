@@ -11,13 +11,29 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{Shutdown, TcpListener};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 const TEST_DATA_SIZE: usize = 1024 * 1024; // 1MB 数据块
+
+fn parse_speed_request(request: &str) -> Result<Duration, String> {
+    let mut parts = request.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("SPEEDTEST_TIME"), Some(value), None) => {
+            let duration_ms = value
+                .parse::<u64>()
+                .map_err(|_| "无效的测速时长".to_string())?;
+            if !(5_000..=120_000).contains(&duration_ms) {
+                return Err("测速时长必须在 5000 到 120000 毫秒之间".to_string());
+            }
+            Ok(Duration::from_millis(duration_ms))
+        }
+        _ => Err("不支持的测速命令".to_string()),
+    }
+}
 
 /// 全局测速服务端状态
 static E2E_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -221,25 +237,29 @@ fn start_e2e_tcp_server() -> Result<u16, String> {
                                     break;
                                 }
                                 let _ = writer.flush();
-                            } else if request.starts_with("SPEEDTEST") {
-                                // 解析请求的 MB 数
-                                let size_mb: usize = request
-                                    .split_whitespace()
-                                    .nth(1)
-                                    .and_then(|s| s.trim_end_matches('\n').parse().ok())
-                                    .unwrap_or(10);
-
-                                let total_bytes = size_mb * 1024 * 1024;
-                                let mut sent = 0usize;
-
-                                while sent < total_bytes
-                                    && E2E_SERVER_RUNNING.load(Ordering::SeqCst)
-                                {
-                                    let to_send = std::cmp::min(TEST_DATA_SIZE, total_bytes - sent);
-                                    match writer.write_all(&data[..to_send]) {
-                                        Ok(_) => sent += to_send,
-                                        Err(_) => break,
+                            } else if request.starts_with("SPEEDTEST_TIME ") {
+                                match parse_speed_request(&request) {
+                                    Ok(duration) => {
+                                        let _ = writer
+                                            .set_write_timeout(Some(Duration::from_millis(100)));
+                                        let deadline = Instant::now() + duration;
+                                        while Instant::now() < deadline
+                                            && E2E_SERVER_RUNNING.load(Ordering::SeqCst)
+                                        {
+                                            match writer.write(&data) {
+                                                Ok(0) => break,
+                                                Ok(_) => {}
+                                                Err(error)
+                                                    if error.kind()
+                                                        == std::io::ErrorKind::WouldBlock
+                                                        || error.kind()
+                                                            == std::io::ErrorKind::TimedOut => {}
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        let _ = writer.shutdown(Shutdown::Both);
                                     }
+                                    Err(error) => warn!("无效测速请求: {}", error),
                                 }
                                 break;
                             }
@@ -264,6 +284,26 @@ fn start_e2e_tcp_server() -> Result<u16, String> {
 fn stop_e2e_tcp_server() {
     E2E_SERVER_RUNNING.store(false, Ordering::SeqCst);
     E2E_SERVER_PORT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod speed_protocol_tests {
+    use super::parse_speed_request;
+    use std::time::Duration;
+
+    #[test]
+    fn parses_time_speed_request() {
+        assert_eq!(
+            parse_speed_request("SPEEDTEST_TIME 15000\n").unwrap(),
+            Duration::from_secs(15)
+        );
+    }
+
+    #[test]
+    fn rejects_time_request_outside_limits() {
+        assert!(parse_speed_request("SPEEDTEST_TIME 4000\n").is_err());
+        assert!(parse_speed_request("SPEEDTEST_TIME 121000\n").is_err());
+    }
 }
 
 /// 调用 chmlfrp API 创建临时隧道

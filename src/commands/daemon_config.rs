@@ -19,7 +19,8 @@ pub async fn get_config(ctx: &CommandContext) -> CommandResult {
         .map_err(|e| RpcError::new("CONFIG_LOAD_FAILED", e.to_string()))?;
 
     // 返回时隐藏完整 token，只返回前 8 位 + ...
-    let accounts: Vec<serde_json::Value> = cfg.accounts
+    let accounts: Vec<serde_json::Value> = cfg
+        .accounts
         .iter()
         .enumerate()
         .map(|(i, acc)| {

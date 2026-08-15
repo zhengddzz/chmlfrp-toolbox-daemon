@@ -9,6 +9,9 @@
 //! [update]
 //! auto_update = false
 //!
+//! [log]
+//! retention_days = 7
+//!
 //! [[accounts]]
 //! proxy_token = "xxx"
 //! device_name = "西安服务器"
@@ -24,6 +27,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub update: UpdateConfig,
+    #[serde(default)]
+    pub log: LogConfig,
     #[serde(default)]
     pub accounts: Vec<AccountConfig>,
 }
@@ -48,6 +53,26 @@ pub struct UpdateConfig {
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self { auto_update: false }
+    }
+}
+
+/// 日志配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    /// 日志文件保留天数（超过自动删除，0 表示永不清理）
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+}
+
+fn default_retention_days() -> u64 {
+    7
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_retention_days(),
+        }
     }
 }
 
@@ -132,10 +157,19 @@ pub fn add_account(path: &Path, token: String, name: String) -> anyhow::Result<(
 }
 
 /// 修改账号（按索引，1-based）
-pub fn modify_account(path: &Path, index: usize, token: Option<String>, name: Option<String>) -> anyhow::Result<()> {
+pub fn modify_account(
+    path: &Path,
+    index: usize,
+    token: Option<String>,
+    name: Option<String>,
+) -> anyhow::Result<()> {
     let mut cfg = load_config(path)?;
     if index == 0 || index > cfg.accounts.len() {
-        anyhow::bail!("账号序号无效: {}（共 {} 个账号）", index, cfg.accounts.len());
+        anyhow::bail!(
+            "账号序号无效: {}（共 {} 个账号）",
+            index,
+            cfg.accounts.len()
+        );
     }
     let acc = &mut cfg.accounts[index - 1];
     if let Some(t) = token {
@@ -151,7 +185,11 @@ pub fn modify_account(path: &Path, index: usize, token: Option<String>, name: Op
 pub fn delete_account(path: &Path, index: usize) -> anyhow::Result<()> {
     let mut cfg = load_config(path)?;
     if index == 0 || index > cfg.accounts.len() {
-        anyhow::bail!("账号序号无效: {}（共 {} 个账号）", index, cfg.accounts.len());
+        anyhow::bail!(
+            "账号序号无效: {}（共 {} 个账号）",
+            index,
+            cfg.accounts.len()
+        );
     }
     cfg.accounts.remove(index - 1);
     save_config(path, &cfg)
@@ -214,7 +252,11 @@ pub fn save_auto_update_override(data_dir: &str, enabled: bool) -> anyhow::Resul
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
 
-    info!("auto_update override 已保存: {} = {}", path.display(), enabled);
+    info!(
+        "auto_update override 已保存: {} = {}",
+        path.display(),
+        enabled
+    );
     Ok(())
 }
 
@@ -240,6 +282,7 @@ pub fn generate_template(path: &Path) -> anyhow::Result<()> {
             data_dir: default_data_dir(),
         },
         update: UpdateConfig::default(),
+        log: LogConfig::default(),
         accounts: vec![AccountConfig {
             proxy_token: "在此填入你的_proxyToken".to_string(),
             device_name: "我的服务器".to_string(),

@@ -2,8 +2,8 @@
 //!
 //! 与桌面客户端的 TCP 测速服务端协议匹配：
 //!   1. 客户端连接 host:port
-//!   2. 发送 ASCII 命令 `SPEEDTEST <size_mb>\n`
-//!   3. 服务端循环发送 1MB 零字节数据块，达到 size_mb 后关闭连接
+//!   2. 发送 ASCII 命令 `SPEEDTEST_TIME <duration_ms>\n`
+//!   3. 服务端持续发送数据直到指定时长结束
 //!   4. 客户端统计接收字节数和耗时，计算下载速度
 //!
 //! 用于端对端测试：桌面客户端A创建临时隧道+测速服务端，
@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -20,8 +20,7 @@ use tracing::info;
 const PROGRESS_INTERVAL_MS: u64 = 200;
 /// 读缓冲区大小
 const READ_BUF_SIZE: usize = 256 * 1024;
-/// 默认测速数据量（MB）
-const DEFAULT_SIZE_MB: usize = 10;
+const FIRST_PACKET_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,9 +29,7 @@ struct TcpSpeedTestParams {
     host: String,
     /// 目标端口（隧道远程端口）
     port: u16,
-    /// 请求下载的数据量（MB），默认 10
-    #[serde(default = "default_size_mb")]
-    size_mb: usize,
+    duration_seconds: u64,
     /// 连接超时（秒），默认 10
     #[serde(default = "default_connect_timeout")]
     connect_timeout_secs: u64,
@@ -41,10 +38,6 @@ struct TcpSpeedTestParams {
     read_timeout_secs: u64,
     #[serde(default)]
     run_id: String,
-}
-
-fn default_size_mb() -> usize {
-    DEFAULT_SIZE_MB
 }
 
 fn default_connect_timeout() -> u64 {
@@ -62,7 +55,26 @@ struct TcpSpeedTestResult {
     speed_mbps: f64,
     total_bytes: u64,
     duration_ms: u64,
+    speed_samples: Vec<SpeedSample>,
     error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpeedSample {
+    second: usize,
+    bytes: u64,
+    duration_ms: u64,
+    mbps: f64,
+}
+
+fn parse_params(params: &serde_json::Value) -> Result<TcpSpeedTestParams, String> {
+    let parsed: TcpSpeedTestParams = serde_json::from_value(params.clone())
+        .map_err(|error| format!("参数解析失败: {}", error))?;
+    if !(5..=120).contains(&parsed.duration_seconds) {
+        return Err("durationSeconds 必须在 5 到 120 之间".to_string());
+    }
+    Ok(parsed)
 }
 
 /// 推送进度（非关键错误忽略）
@@ -84,8 +96,7 @@ pub async fn handle(
     params: &serde_json::Value,
     ctx: &super::CommandContext,
 ) -> super::CommandResult {
-    let p: TcpSpeedTestParams = serde_json::from_value(params.clone())
-        .map_err(|e| super::RpcError::new("EXEC_FAILED", format!("参数解析失败: {}", e)))?;
+    let p = parse_params(params).map_err(|error| super::RpcError::new("INVALID_PARAMS", error))?;
 
     if p.host.is_empty() {
         return Err(super::RpcError::new("INVALID_PARAMS", "host 不能为空"));
@@ -95,15 +106,15 @@ pub async fn handle(
     }
 
     info!(
-        "[tcp_speed_test] {}:{} size={}MB",
-        p.host, p.port, p.size_mb
+        "[tcp_speed_test] {}:{} duration={}s",
+        p.host, p.port, p.duration_seconds
     );
 
     send_progress(ctx, 0.0, "connecting", 0.0);
 
     let host = p.host.clone();
     let port = p.port;
-    let size_mb = p.size_mb;
+    let duration_seconds = p.duration_seconds;
     let connect_timeout = p.connect_timeout_secs;
     let read_timeout = p.read_timeout_secs;
     let request_id = ctx.request_id.clone();
@@ -116,7 +127,7 @@ pub async fn handle(
         run_tcp_speed_test(
             &host,
             port,
-            size_mb,
+            duration_seconds,
             connect_timeout,
             read_timeout,
             &request_id,
@@ -148,9 +159,9 @@ pub async fn handle(
 fn run_tcp_speed_test(
     host: &str,
     port: u16,
-    size_mb: usize,
+    duration_seconds: u64,
     connect_timeout_secs: u64,
-    read_timeout_secs: u64,
+    _read_timeout_secs: u64,
     request_id: &str,
     account_id: &str,
     run_id: &str,
@@ -159,100 +170,132 @@ fn run_tcp_speed_test(
         tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<super::ProgressPayload>>>,
     >,
 ) -> Result<TcpSpeedTestResult, String> {
-    let target_bytes = (size_mb as u64) * 1024 * 1024;
-
-    // 解析地址
     let addr_str = format!("{}:{}", host, port);
     let socket_addr = addr_str
         .to_socket_addrs()
         .map_err(|e| format!("解析地址失败: {}", e))?
         .next()
         .ok_or_else(|| "无法解析主机地址".to_string())?;
+    run_speed_test(
+        socket_addr,
+        Duration::from_secs(duration_seconds),
+        Duration::from_secs(connect_timeout_secs),
+        Duration::from_millis(200),
+        &|| super::is_run_cancelled(account_id, run_id, generation),
+        &|progress, speed| push_progress(progress_tx, request_id, progress, "downloading", speed),
+    )
+}
 
-    let start = Instant::now();
-
-    // 建立连接
-    let mut stream =
-        TcpStream::connect_timeout(&socket_addr, Duration::from_secs(connect_timeout_secs))
-            .map_err(|e| format!("连接失败: {}", e))?;
-
-    // 设置超时
-    let read_timeout = Duration::from_millis(200);
-    stream.set_read_timeout(Some(read_timeout)).ok();
-    stream.set_write_timeout(Some(read_timeout)).ok();
-
-    // 发送测速命令
-    let cmd = format!("SPEEDTEST {}\n", size_mb);
+fn run_speed_test<F, P>(
+    socket_addr: SocketAddr,
+    duration: Duration,
+    connect_timeout: Duration,
+    read_poll_interval: Duration,
+    cancelled: &F,
+    progress_callback: &P,
+) -> Result<TcpSpeedTestResult, String>
+where
+    F: Fn() -> bool,
+    P: Fn(f64, f64),
+{
+    let mut stream = TcpStream::connect_timeout(&socket_addr, connect_timeout)
+        .map_err(|error| format!("连接失败: {}", error))?;
+    stream.set_read_timeout(Some(read_poll_interval)).ok();
+    stream.set_write_timeout(Some(connect_timeout)).ok();
+    let command = format!("SPEEDTEST_TIME {}\n", duration.as_millis());
     stream
-        .write_all(cmd.as_bytes())
-        .map_err(|e| format!("发送命令失败: {}", e))?;
+        .write_all(command.as_bytes())
+        .map_err(|error| format!("发送命令失败: {}", error))?;
 
-    // 接收数据
+    let waiting_since = Instant::now();
     let mut buf = vec![0u8; READ_BUF_SIZE];
     let mut received: u64 = 0;
-    let mut last_progress = Instant::now();
+    let mut transfer_start: Option<Instant> = None;
+    let mut last_progress: Option<Instant> = None;
+    let mut sample_started_at: Option<Instant> = None;
+    let mut sample_bytes = 0u64;
+    let mut speed_samples = Vec::new();
 
     loop {
-        if super::is_run_cancelled(account_id, run_id, generation) {
+        if cancelled() {
+            let _ = stream.shutdown(Shutdown::Both);
             return Err("测速已强制停止".to_string());
         }
+        if transfer_start.is_none() && waiting_since.elapsed() >= FIRST_PACKET_TIMEOUT {
+            let _ = stream.shutdown(Shutdown::Both);
+            return Err("测速连接未返回数据".to_string());
+        }
+        if transfer_start.is_some_and(|started| started.elapsed() >= duration) {
+            let _ = stream.shutdown(Shutdown::Both);
+            break;
+        }
         match stream.read(&mut buf) {
-            Ok(0) => break, // EOF，服务端发完关闭连接
+            Ok(0) if transfer_start.is_none() => return Err("测速连接未返回数据".to_string()),
+            Ok(0) => break,
             Ok(n) => {
+                let now = Instant::now();
+                let first = *transfer_start.get_or_insert(now);
+                let progress_start = *last_progress.get_or_insert(first);
+                let window_start = *sample_started_at.get_or_insert(first);
                 received += n as u64;
+                sample_bytes += n as u64;
 
-                // 定期推送进度
-                if last_progress.elapsed() >= Duration::from_millis(PROGRESS_INTERVAL_MS) {
-                    let progress = if target_bytes > 0 {
-                        (received as f64 / target_bytes as f64 * 100.0).min(99.0)
-                    } else {
-                        50.0
-                    };
-                    let elapsed_secs = start.elapsed().as_secs_f64();
-                    let current_speed = if elapsed_secs > 0.0 {
-                        (received as f64 * 8.0) / elapsed_secs / 1_000_000.0
-                    } else {
-                        0.0
-                    };
-                    push_progress(
-                        progress_tx,
-                        request_id,
-                        progress,
-                        "downloading",
-                        current_speed,
-                    );
-                    last_progress = Instant::now();
+                if now.duration_since(progress_start) >= Duration::from_millis(PROGRESS_INTERVAL_MS)
+                {
+                    let progress =
+                        (first.elapsed().as_secs_f64() / duration.as_secs_f64() * 100.0).min(99.0);
+                    let current_speed = calc_speed(sample_bytes, now.duration_since(window_start));
+                    progress_callback(progress, current_speed);
+                    last_progress = Some(now);
+                }
+                if now.duration_since(window_start) >= Duration::from_secs(1) {
+                    let window = now.duration_since(window_start);
+                    speed_samples.push(SpeedSample {
+                        second: speed_samples.len() + 1,
+                        bytes: sample_bytes,
+                        duration_ms: window.as_millis() as u64,
+                        mbps: calc_speed(sample_bytes, window),
+                    });
+                    sample_started_at = Some(now);
+                    sample_bytes = 0;
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(ref e)
                 if (e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut)
-                    && start.elapsed() < Duration::from_secs(read_timeout_secs) =>
+                    || e.kind() == std::io::ErrorKind::TimedOut) =>
             {
                 continue
             }
-            Err(e) => {
-                return Ok(TcpSpeedTestResult {
-                    success: received > 0,
-                    speed_mbps: calc_speed(received, start.elapsed()),
-                    total_bytes: received,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    error: Some(format!("读取数据失败: {}", e)),
-                });
-            }
+            Err(_) if transfer_start.is_none() => return Err("测速连接未返回数据".to_string()),
+            Err(e) => return Err(format!("读取数据失败: {}", e)),
         }
     }
 
-    let elapsed = start.elapsed();
+    let elapsed = transfer_start
+        .map(|value| value.elapsed())
+        .unwrap_or_default();
+    if sample_bytes > 0 {
+        let window = sample_started_at
+            .map(|value| value.elapsed())
+            .unwrap_or_default();
+        speed_samples.push(SpeedSample {
+            second: speed_samples.len() + 1,
+            bytes: sample_bytes,
+            duration_ms: window.as_millis() as u64,
+            mbps: calc_speed(sample_bytes, window),
+        });
+    }
     let speed_mbps = calc_speed(received, elapsed);
+    let ended_early = elapsed + Duration::from_millis(250) < duration;
 
     Ok(TcpSpeedTestResult {
-        success: received > 0,
+        success: received > 0 && !ended_early,
         speed_mbps,
         total_bytes: received,
         duration_ms: elapsed.as_millis() as u64,
-        error: None,
+        speed_samples,
+        error: ended_early.then(|| "测速连接在目标时长前结束".to_string()),
     })
 }
 
@@ -285,5 +328,75 @@ fn push_progress(
                 speed_mbps,
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{calc_speed, parse_params, run_speed_test, FIRST_PACKET_TIMEOUT};
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn parses_duration_parameter() {
+        let duration =
+            parse_params(&serde_json::json!({"host":"127.0.0.1","port":1,"durationSeconds":15}))
+                .unwrap();
+        assert_eq!(duration.duration_seconds, 15);
+    }
+
+    #[test]
+    fn rejects_duration_outside_limits() {
+        assert!(parse_params(
+            &serde_json::json!({"host":"127.0.0.1","port":1,"durationSeconds":4})
+        )
+        .is_err());
+        assert!(parse_params(
+            &serde_json::json!({"host":"127.0.0.1","port":1,"durationSeconds":121})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn calculates_window_speed_and_protects_zero_duration() {
+        assert_eq!(calc_speed(1_000_000, Duration::from_secs(1)), 8.0);
+        assert_eq!(calc_speed(1_000_000, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn first_packet_timeout_is_three_seconds() {
+        assert_eq!(FIRST_PACKET_TIMEOUT, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn duration_protocol_stops_at_deadline_without_waiting_for_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut command = String::new();
+            stream.read_line(&mut command).unwrap();
+            assert!(command.starts_with("SPEEDTEST_TIME "));
+            let payload = vec![0u8; 64 * 1024];
+            while stream.get_mut().write_all(&payload).is_ok() {}
+        });
+
+        let started = Instant::now();
+        let result = run_speed_test(
+            address,
+            Duration::from_millis(150),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+            &|| false,
+            &|_, _| {},
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert!(result.success);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

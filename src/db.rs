@@ -18,7 +18,9 @@ pub fn init_db_dir(data_dir: &str) -> anyhow::Result<()> {
 
 /// 获取指定 user_id 的数据库路径
 pub fn user_db_path(data_dir: &str, user_id: i64) -> PathBuf {
-    Path::new(data_dir).join("users").join(format!("{}.db", user_id))
+    Path::new(data_dir)
+        .join("users")
+        .join(format!("{}.db", user_id))
 }
 
 /// 初始化用户数据库（创建表）
