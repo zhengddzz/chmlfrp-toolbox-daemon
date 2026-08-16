@@ -1,6 +1,6 @@
 [package]
 name = "chmlfrp-toolbox-daemon"
-version = "0.3.14"
+version = "0.3.15"
 edition = "2021"
 description = "ChmlFrp 社区工具箱 Daemon - 服务器端远程管理守护进程"
 license = "MIT"

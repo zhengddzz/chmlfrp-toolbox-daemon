@@ -10,9 +10,12 @@
 //! 测试完成后发起方调用 e2e_cleanup 清理资源。
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
@@ -39,9 +42,13 @@ fn parse_speed_request(request: &str) -> Result<Duration, String> {
 static E2E_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 static E2E_SERVER_PORT: AtomicU16 = AtomicU16::new(0);
 
-/// 全局 frpc 子进程句柄（存储 PID 用于清理）
-static FRPC_PID: Mutex<Option<u32>> = Mutex::new(None);
-static FRPC_CONFIG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+struct FrpcProcess {
+    child: Child,
+    config_path: std::path::PathBuf,
+    logs: Arc<Mutex<VecDeque<String>>>,
+}
+
+static FRPC_PROCESS: Mutex<Option<FrpcProcess>> = Mutex::new(None);
 
 /// 全局隧道信息（用于 cleanup 时删除）
 static E2E_TUNNEL_ID: Mutex<Option<i64>> = Mutex::new(None);
@@ -290,7 +297,8 @@ fn stop_e2e_tcp_server() {
 #[cfg(test)]
 mod speed_protocol_tests {
     use super::{
-        is_remote_port_conflict, parse_node_address, parse_speed_request, remote_port_candidates,
+        build_frpc_config, is_remote_port_conflict, parse_node_address, parse_speed_request,
+        remote_port_candidates, validate_probe_response,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -347,6 +355,45 @@ mod speed_protocol_tests {
             .copied()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), ports.len());
+    }
+
+    #[test]
+    fn frpc_config_contains_user_credential() {
+        let config = build_frpc_config(
+            "node.example.com",
+            7000,
+            "user-token",
+            "node-token",
+            31000,
+            32000,
+            "e2etest_1",
+        )
+        .unwrap();
+
+        assert!(config.contains("user = user-token"));
+        assert!(config.contains("token = node-token"));
+    }
+
+    #[test]
+    fn frpc_config_rejects_newline_in_credentials() {
+        let result = build_frpc_config(
+            "node.example.com",
+            7000,
+            "user-token\nadmin_addr = 0.0.0.0",
+            "node-token",
+            31000,
+            32000,
+            "e2etest_1",
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn probe_response_requires_matching_sequence() {
+        assert!(validate_probe_response("PONG ready-123\n", "ready-123"));
+        assert!(!validate_probe_response("PONG other\n", "ready-123"));
+        assert!(!validate_probe_response("HTTP/1.1 200 OK\n", "ready-123"));
     }
 }
 
@@ -620,11 +667,66 @@ async fn delete_tunnel(backend_url: &str, proxy_token: &str, tunnel_id: i64) -> 
 }
 
 /// 启动 frpc 子进程
+fn validate_ini_value(value: &str, field_name: &str) -> Result<(), String> {
+    if value.contains(['\n', '\r', '[', ']', '=', '\0']) {
+        return Err(format!("字段 {} 包含非法字符", field_name));
+    }
+    Ok(())
+}
+
+fn build_frpc_config(
+    node_ip: &str,
+    server_port: u16,
+    user_token: &str,
+    node_token: &str,
+    local_port: u16,
+    remote_port: u16,
+    tunnel_name: &str,
+) -> Result<String, String> {
+    validate_ini_value(node_ip, "server_addr")?;
+    validate_ini_value(user_token, "user")?;
+    validate_ini_value(node_token, "token")?;
+    validate_ini_value(tunnel_name, "tunnel_name")?;
+    Ok(format!(
+        "[common]\nserver_addr = {}\nserver_port = {}\nuser = {}\ntoken = {}\nlog_level = info\ntls_enable = false\ntcp_mux = true\npool_count = 5\n\n[{}]\ntype = tcp\nlocal_ip = 127.0.0.1\nlocal_port = {}\nremote_port = {}\n",
+        node_ip,
+        server_port,
+        user_token,
+        node_token,
+        tunnel_name,
+        local_port,
+        remote_port
+    ))
+}
+
+fn capture_frpc_output<R: std::io::Read + Send + 'static>(
+    reader: R,
+    logs: Arc<Mutex<VecDeque<String>>>,
+    secrets: Vec<String>,
+) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            let line = secrets
+                .iter()
+                .filter(|secret| !secret.is_empty())
+                .fold(line, |value, secret| value.replace(secret, "[已脱敏]"));
+            let line = line.chars().take(500).collect::<String>();
+            if let Ok(mut guard) = logs.lock() {
+                if guard.len() >= 30 {
+                    guard.pop_front();
+                }
+                guard.push_back(line);
+            }
+        }
+    });
+}
+
 fn start_frpc(
     frpc_path: &std::path::Path,
     data_dir: &str,
     node_ip: &str,
     server_port: u16,
+    user_token: &str,
     node_token: &str,
     local_port: u16,
     remote_port: u16,
@@ -632,79 +734,124 @@ fn start_frpc(
 ) -> Result<u32, String> {
     let config_dir = std::path::Path::new(data_dir).join("e2e");
     std::fs::create_dir_all(&config_dir).map_err(|e| format!("创建frpc配置目录失败: {}", e))?;
-    let config_path = config_dir.join(format!("e2e_frpc_{}.toml", std::process::id()));
-
-    let config_content = format!(
-        r#"[common]
-server_addr = "{}"
-server_port = {}
-token = "{}"
-
-[{}]
-type = tcp
-local_ip = 127.0.0.1
-local_port = {}
-remote_port = {}
-"#,
-        node_ip, server_port, node_token, tunnel_name, local_port, remote_port
-    );
+    let config_path = config_dir.join(format!("e2e_frpc_{}.ini", std::process::id()));
+    let config_content = build_frpc_config(
+        node_ip,
+        server_port,
+        user_token,
+        node_token,
+        local_port,
+        remote_port,
+        tunnel_name,
+    )?;
 
     std::fs::write(&config_path, &config_content)
         .map_err(|e| format!("写入frpc配置失败: {}", e))?;
 
-    // 启动 frpc 子进程
-    let child = std::process::Command::new(frpc_path)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("设置frpc配置权限失败: {}", e))?;
+    }
+
+    let mut child = std::process::Command::new(frpc_path)
         .arg("-c")
         .arg(&config_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("启动frpc失败: {}（路径: {}）", e, frpc_path.display()))?;
 
     let pid = child.id();
-
-    // 保存 PID 和配置路径
-    if let Ok(mut guard) = FRPC_PID.lock() {
-        *guard = Some(pid);
+    let logs = Arc::new(Mutex::new(VecDeque::new()));
+    let secrets = vec![user_token.to_string(), node_token.to_string()];
+    if let Some(stdout) = child.stdout.take() {
+        capture_frpc_output(stdout, Arc::clone(&logs), secrets.clone());
     }
-    if let Ok(mut guard) = FRPC_CONFIG_PATH.lock() {
-        *guard = Some(config_path);
+    if let Some(stderr) = child.stderr.take() {
+        capture_frpc_output(stderr, Arc::clone(&logs), secrets);
     }
-
-    // 注意：不等待 child，让它后台运行
-    // 配置文件在 cleanup 时删除
-    std::mem::forget(child);
+    let mut guard = FRPC_PROCESS
+        .lock()
+        .map_err(|e| format!("保存frpc进程失败: {}", e))?;
+    *guard = Some(FrpcProcess {
+        child,
+        config_path,
+        logs,
+    });
 
     info!("[e2e] frpc 已启动，PID: {}", pid);
     Ok(pid)
 }
 
-/// 停止 frpc 子进程
+fn frpc_exit_error() -> Option<String> {
+    let mut guard = FRPC_PROCESS.lock().ok()?;
+    let process = guard.as_mut()?;
+    let status = match process.child.try_wait() {
+        Ok(Some(status)) => status,
+        Ok(None) => return None,
+        Err(error) => return Some(format!("检查frpc状态失败: {}", error)),
+    };
+    let logs = process
+        .logs
+        .lock()
+        .ok()
+        .map(|logs| logs.iter().cloned().collect::<Vec<_>>().join(" | "))
+        .unwrap_or_default();
+    Some(if logs.is_empty() {
+        format!("frpc 已退出: {}", status)
+    } else {
+        format!("frpc 已退出: {}，日志: {}", status, logs)
+    })
+}
+
 fn stop_frpc() {
-    if let Ok(mut guard) = FRPC_PID.lock() {
-        if let Some(pid) = guard.take() {
-            // 发送 SIGTERM（Linux）
-            #[cfg(unix)]
-            {
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .spawn();
+    if let Ok(mut guard) = FRPC_PROCESS.lock() {
+        if let Some(mut process) = guard.take() {
+            let pid = process.child.id();
+            if process.child.try_wait().ok().flatten().is_none() {
+                let _ = process.child.kill();
+                let _ = process.child.wait();
             }
-            // Windows 用 taskkill
-            #[cfg(windows)]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(&["/PID", &pid.to_string(), "/F"])
-                    .spawn();
-            }
+            let _ = std::fs::remove_file(process.config_path);
             info!("[e2e] frpc 已停止，PID: {}", pid);
         }
     }
+}
 
-    if let Ok(mut guard) = FRPC_CONFIG_PATH.lock() {
-        if let Some(config_path) = guard.take() {
-            let _ = std::fs::remove_file(config_path);
-        }
+fn validate_probe_response(response: &str, sequence: &str) -> bool {
+    response.trim() == format!("PONG {}", sequence)
+}
+
+async fn probe_tunnel(node_ip: &str, remote_port: u16) -> Result<bool, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let address = format!("{}:{}", node_ip, remote_port);
+    let stream = match tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(&address),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) | Err(_) => return Ok(false),
+    };
+    let sequence = format!("ready-{}", uuid::Uuid::new_v4());
+    let (reader, mut writer) = stream.into_split();
+    writer
+        .write_all(format!("PING {}\n", sequence).as_bytes())
+        .await
+        .map_err(|e| format!("发送隧道探测失败: {}", e))?;
+    let mut response = String::new();
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::BufReader::new(reader).read_line(&mut response),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) if bytes > 0 => Ok(validate_probe_response(&response, &sequence)),
+        Ok(Ok(_)) | Err(_) => Ok(false),
+        Ok(Err(error)) => Err(format!("读取隧道探测失败: {}", error)),
     }
 }
 
@@ -758,6 +905,17 @@ pub async fn handle_setup(
     }
     let proxy_token = ctx.proxy_token.clone();
     let backend_url = ctx.backend_url.clone();
+
+    let user_token = match super::auth::ensure_user_token(&backend_url, &proxy_token).await {
+        Ok(token) => token,
+        Err(error) => {
+            complete_run(&ctx.account_id, &p.run_id, generation);
+            return Err(super::RpcError::new(
+                "FRPC_AUTH_FAILED",
+                error.user_message(),
+            ));
+        }
+    };
 
     let frpc_path = match crate::frpc::ensure_frpc(&ctx.data_dir).await {
         Ok(path) => path,
@@ -813,6 +971,7 @@ pub async fn handle_setup(
         &ctx.data_dir,
         &node_ip,
         server_port,
+        &user_token,
         &node_token,
         tcp_port,
         remote_port,
@@ -825,6 +984,40 @@ pub async fn handle_setup(
         return Err(super::RpcError::new("EXEC_FAILED", e));
     }
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if super::is_run_cancelled(&ctx.account_id, &p.run_id, generation) {
+            stop_frpc();
+            let _ = delete_tunnel(&backend_url, &proxy_token, tunnel_id).await;
+            stop_e2e_tcp_server();
+            complete_run(&ctx.account_id, &p.run_id, generation);
+            return Err(super::RpcError::new("CANCELLED", "测速已强制停止"));
+        }
+        if let Some(error) = frpc_exit_error() {
+            stop_frpc();
+            let _ = delete_tunnel(&backend_url, &proxy_token, tunnel_id).await;
+            stop_e2e_tcp_server();
+            complete_run(&ctx.account_id, &p.run_id, generation);
+            return Err(super::RpcError::new("FRPC_START_FAILED", error));
+        }
+        match probe_tunnel(&node_ip, remote_port).await {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(error) => warn!("[e2e_setup] 隧道探测失败: {}", error),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            stop_frpc();
+            let _ = delete_tunnel(&backend_url, &proxy_token, tunnel_id).await;
+            stop_e2e_tcp_server();
+            complete_run(&ctx.account_id, &p.run_id, generation);
+            return Err(super::RpcError::new(
+                "TUNNEL_READY_TIMEOUT",
+                format!("隧道在 30 秒内未就绪: {}:{}", node_ip, remote_port),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
     let ready = RESOURCE_COORDINATOR
         .lock()
         .map(|mut coordinator| coordinator.mark_ready(&ctx.account_id, &p.run_id, generation))
@@ -835,19 +1028,6 @@ pub async fn handle_setup(
         stop_e2e_tcp_server();
         complete_run(&ctx.account_id, &p.run_id, generation);
         return Err(super::RpcError::new("CANCELLED", "测速资源已进入清理流程"));
-    }
-
-    if super::is_run_cancelled(&ctx.account_id, &p.run_id, generation) {
-        let _ = handle_cleanup(params, ctx).await;
-        return Err(super::RpcError::new("CANCELLED", "测速已强制停止"));
-    }
-
-    // 5. 等待 frpc 连接建立
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    if super::is_run_cancelled(&ctx.account_id, &p.run_id, generation) {
-        let _ = handle_cleanup(params, ctx).await;
-        return Err(super::RpcError::new("CANCELLED", "测速已强制停止"));
     }
 
     let result = E2eSetupResult {

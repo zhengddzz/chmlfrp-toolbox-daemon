@@ -61,6 +61,7 @@ impl RefreshError {
 /// 缓存条目
 struct CachedToken {
     access_token: String,
+    user_token: Option<String>,
     /// 过期时间点
     expires_at: Instant,
 }
@@ -97,8 +98,11 @@ struct TokenCache {
     entries: HashMap<String, CachedToken>,
 }
 
-static TOKEN_CACHE: Lazy<Arc<Mutex<TokenCache>>> =
-    Lazy::new(|| Arc::new(Mutex::new(TokenCache { entries: HashMap::new() })));
+static TOKEN_CACHE: Lazy<Arc<Mutex<TokenCache>>> = Lazy::new(|| {
+    Arc::new(Mutex::new(TokenCache {
+        entries: HashMap::new(),
+    }))
+});
 
 fn token_key(proxy_token: &str) -> String {
     // 与 telemetry.rs 一致：以 sha256 摘要做 key，不在内存 map 中散落明文
@@ -140,10 +144,81 @@ pub async fn ensure_access_token(
         key,
         CachedToken {
             access_token: access_token.clone(),
+            user_token: None,
             expires_at: Instant::now() + Duration::from_secs(ttl_secs),
         },
     );
     Ok(access_token)
+}
+
+fn parse_user_token(body: &str) -> Result<String, RefreshError> {
+    let data: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| RefreshError::new("USERINFO_FAILED", format!("解析用户信息失败: {}", e)))?;
+    if data.get("code").and_then(|value| value.as_u64()) != Some(200) {
+        let message = data
+            .get("msg")
+            .and_then(|value| value.as_str())
+            .unwrap_or("获取用户信息失败");
+        return Err(RefreshError::new("USERINFO_FAILED", message));
+    }
+    data.get("data")
+        .and_then(|value| value.get("usertoken"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| RefreshError::new("USERINFO_FAILED", "用户信息缺少 usertoken"))
+}
+
+pub async fn ensure_user_token(
+    backend_url: &str,
+    proxy_token: &str,
+) -> Result<String, RefreshError> {
+    let access_token = ensure_access_token(backend_url, proxy_token).await?;
+    let key = token_key(proxy_token);
+    {
+        let cache = TOKEN_CACHE.lock().await;
+        if let Some(entry) = cache.entries.get(&key) {
+            if entry.is_usable() && entry.access_token == access_token {
+                if let Some(user_token) = entry.user_token.as_ref() {
+                    return Ok(user_token.clone());
+                }
+            }
+        }
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .map_err(|e| {
+            RefreshError::new("USERINFO_FAILED", format!("创建 HTTP 客户端失败: {}", e))
+        })?;
+    let response = client
+        .get("https://cf-v2.uapis.cn/userinfo")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .map_err(|e| RefreshError::new("USERINFO_FAILED", format!("获取用户信息失败: {}", e)))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|e| RefreshError::new("USERINFO_FAILED", format!("读取用户信息失败: {}", e)))?;
+    if !status.is_success() {
+        return Err(RefreshError::new(
+            "USERINFO_FAILED",
+            format!("获取用户信息失败 (HTTP {})", status),
+        ));
+    }
+    let user_token = parse_user_token(&body)?;
+    let mut cache = TOKEN_CACHE.lock().await;
+    if let Some(entry) = cache.entries.get_mut(&key) {
+        if entry.access_token == access_token {
+            entry.user_token = Some(user_token.clone());
+        }
+    }
+    Ok(user_token)
 }
 
 /// 将 WebSocket 后端地址转为 HTTP 地址（reqwest 只接受 http/https，
@@ -181,10 +256,11 @@ async fn refresh_via_backend(
         .map_err(|e| RefreshError::new("REFRESH_FAILED", format!("读取刷新响应失败: {}", e)))?;
 
     if !status.is_success() {
-        let err: RefreshErrorResponse = serde_json::from_str(&body).unwrap_or(RefreshErrorResponse {
-            code: None,
-            message: None,
-        });
+        let err: RefreshErrorResponse =
+            serde_json::from_str(&body).unwrap_or(RefreshErrorResponse {
+                code: None,
+                message: None,
+            });
         let code = err.code.unwrap_or_else(|| "UNKNOWN".to_string());
         let message = err
             .message
@@ -209,7 +285,9 @@ pub async fn validate_proxy_token(
     backend_url: &str,
     proxy_token: &str,
 ) -> Result<(), RefreshError> {
-    refresh_via_backend(backend_url, proxy_token).await.map(|_| ())
+    refresh_via_backend(backend_url, proxy_token)
+        .await
+        .map(|_| ())
 }
 
 /// 清除指定 proxy_token 的 accessToken 缓存（令牌被更新/删除时调用）
@@ -226,6 +304,7 @@ mod tests {
     fn cached_token_usable_before_threshold() {
         let token = CachedToken {
             access_token: "at".to_string(),
+            user_token: None,
             expires_at: Instant::now() + Duration::from_secs(120),
         };
         assert!(token.is_usable());
@@ -237,6 +316,7 @@ mod tests {
         // 剩余 30s < 60s 阈值：应触发刷新
         let token = CachedToken {
             access_token: "at".to_string(),
+            user_token: None,
             expires_at: Instant::now() + Duration::from_secs(30),
         };
         assert!(!token.is_usable());
@@ -246,6 +326,7 @@ mod tests {
     fn cached_token_fully_expired() {
         let token = CachedToken {
             access_token: "at".to_string(),
+            user_token: None,
             expires_at: Instant::now() - Duration::from_secs(1),
         };
         assert!(!token.is_usable());
@@ -278,10 +359,25 @@ mod tests {
             ws_to_http("wss://api.cct.zdzz.top"),
             "https://api.cct.zdzz.top"
         );
-        assert_eq!(ws_to_http("ws://api.cct.zdzz.top"), "http://api.cct.zdzz.top");
+        assert_eq!(
+            ws_to_http("ws://api.cct.zdzz.top"),
+            "http://api.cct.zdzz.top"
+        );
         assert_eq!(
             ws_to_http("https://api.cct.zdzz.top/"),
             "https://api.cct.zdzz.top"
         );
+    }
+
+    #[test]
+    fn parses_user_token_from_chmlfrp_userinfo() {
+        let body = r#"{"code":200,"data":{"id":1,"usertoken":"frp-user-token"}}"#;
+        assert_eq!(parse_user_token(body).unwrap(), "frp-user-token");
+    }
+
+    #[test]
+    fn rejects_missing_user_token_from_chmlfrp_userinfo() {
+        let body = r#"{"code":200,"data":{"id":1}}"#;
+        assert!(parse_user_token(body).is_err());
     }
 }
