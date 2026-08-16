@@ -146,15 +146,20 @@ pub async fn ensure_access_token(
     Ok(access_token)
 }
 
+/// 将 WebSocket 后端地址转为 HTTP 地址（reqwest 只接受 http/https，
+/// 而 daemon 配置的 backend_url 为 wss/ws 协议）
+fn ws_to_http(url: &str) -> String {
+    url.trim_end_matches('/')
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1)
+}
+
 /// 调后端 /auth/refresh 换 accessToken，返回 (accessToken, 有效期秒数)
 async fn refresh_via_backend(
     backend_url: &str,
     proxy_token: &str,
 ) -> Result<(String, u64), RefreshError> {
-    let url = format!(
-        "{}/auth/refresh",
-        backend_url.trim_end_matches('/')
-    );
+    let url = format!("{}/auth/refresh", ws_to_http(backend_url));
 
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -265,5 +270,18 @@ mod tests {
         let limited = RefreshError::new("RATE_LIMITED", "请求过于频繁");
         assert!(!limited.is_token_expired());
         assert!(limited.user_message().contains("稍后重试"));
+    }
+
+    #[test]
+    fn ws_to_http_converts_websocket_scheme() {
+        assert_eq!(
+            ws_to_http("wss://api.cct.zdzz.top"),
+            "https://api.cct.zdzz.top"
+        );
+        assert_eq!(ws_to_http("ws://api.cct.zdzz.top"), "http://api.cct.zdzz.top");
+        assert_eq!(
+            ws_to_http("https://api.cct.zdzz.top/"),
+            "https://api.cct.zdzz.top"
+        );
     }
 }
