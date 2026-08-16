@@ -41,6 +41,7 @@ static E2E_SERVER_PORT: AtomicU16 = AtomicU16::new(0);
 
 /// 全局 frpc 子进程句柄（存储 PID 用于清理）
 static FRPC_PID: Mutex<Option<u32>> = Mutex::new(None);
+static FRPC_CONFIG_PATH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 /// 全局隧道信息（用于 cleanup 时删除）
 static E2E_TUNNEL_ID: Mutex<Option<i64>> = Mutex::new(None);
@@ -288,7 +289,9 @@ fn stop_e2e_tcp_server() {
 
 #[cfg(test)]
 mod speed_protocol_tests {
-    use super::{parse_node_address, parse_speed_request};
+    use super::{
+        is_remote_port_conflict, parse_node_address, parse_speed_request, remote_port_candidates,
+    };
     use serde_json::json;
     use std::time::Duration;
 
@@ -325,6 +328,26 @@ mod speed_protocol_tests {
             "节点信息中缺少可用地址"
         );
     }
+
+    #[test]
+    fn recognizes_only_remote_port_conflicts_as_retryable() {
+        assert!(is_remote_port_conflict("创建隧道失败: 该远程端口已被占用"));
+        assert!(is_remote_port_conflict("remote port already in use"));
+        assert!(!is_remote_port_conflict("创建隧道失败: 无效的登录状态"));
+        assert!(!is_remote_port_conflict("请求过于频繁"));
+    }
+
+    #[test]
+    fn creates_unique_remote_port_candidates_within_range() {
+        let ports = remote_port_candidates(20000, 20003, 5);
+        assert_eq!(ports.len(), 4);
+        assert!(ports.iter().all(|port| (20000..=20003).contains(port)));
+        let unique = ports
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), ports.len());
+    }
 }
 
 fn parse_node_address(node_data: &serde_json::Value) -> Result<String, String> {
@@ -337,6 +360,25 @@ fn parse_node_address(node_data: &serde_json::Value) -> Result<String, String> {
         .ok_or_else(|| "节点信息中缺少可用地址".to_string())
 }
 
+fn is_remote_port_conflict(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    message.contains("远程端口") && (message.contains("占用") || message.contains("已被使用"))
+        || normalized.contains("remote port")
+            && (normalized.contains("already in use") || normalized.contains("occupied"))
+}
+
+fn remote_port_candidates(min_port: u16, max_port: u16, max_attempts: usize) -> Vec<u16> {
+    let start = min_port.min(max_port);
+    let end = min_port.max(max_port);
+    let count = u32::from(end) - u32::from(start) + 1;
+    let limit = max_attempts.min(count as usize);
+    let offset = (uuid::Uuid::new_v4().as_u128() % u128::from(count)) as u32;
+    (0..limit)
+        .map(|index| u32::from(start) + (offset + index as u32) % count)
+        .map(|port| port as u16)
+        .collect()
+}
+
 /// 调用 chmlfrp API 创建临时隧道
 ///
 /// chmlfrp API 只认 qzhua accessToken，先用 proxy_token 调后端
@@ -346,7 +388,7 @@ async fn create_temp_tunnel(
     proxy_token: &str,
     node_name: &str,
     local_port: u16,
-) -> Result<(i64, String, u16, String, u16), String> {
+) -> Result<(i64, String, u16, String, u16, String), String> {
     // 0. 获取 accessToken（chmlfrp API 不认 proxy_token，直接用会报"无效的登录状态"）
     let access_token = super::auth::ensure_access_token(backend_url, proxy_token)
         .await
@@ -415,48 +457,74 @@ async fn create_temp_tunnel(
         .and_then(|v| v.as_u64())
         .unwrap_or(7000) as u16;
 
-    // 2. 随机选择端口
+    // 2. 选择远程端口；仅对明确的端口占用错误更换端口重试
     let (min_port, max_port) = parse_port_range(rport_str);
-    let remote_port =
-        min_port + (uuid::Uuid::new_v4().as_u128() as u16) % (max_port - min_port + 1);
-
-    // 3. 创建隧道
-    let tunnel_name = format!("e2etest_{}_{}", chrono_timestamp(), remote_port);
-
-    let create_body = serde_json::json!({
-        "tunnelname": tunnel_name,
-        "node": node_name,
-        "localip": "127.0.0.1",
-        "porttype": "tcp",
-        "localport": local_port,
-        "remoteport": remote_port,
-        "encryption": false,
-        "compression": false,
-        "extraparams": "",
-    });
-
     let create_url = "https://cf-v2.uapis.cn/create_tunnel";
-    let create_resp = client
-        .post(create_url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .json(&create_body)
-        .send()
-        .await
-        .map_err(|e| format!("创建隧道失败: {}", e))?;
+    let candidates = remote_port_candidates(min_port, max_port, 5);
+    let mut selected = None;
+    for (attempt, remote_port) in candidates.iter().copied().enumerate() {
+        let tunnel_name = format!(
+            "e2etest_{}_{}_{}",
+            chrono_timestamp(),
+            remote_port,
+            attempt + 1
+        );
+        let create_body = serde_json::json!({
+            "tunnelname": tunnel_name,
+            "node": node_name,
+            "localip": "127.0.0.1",
+            "porttype": "tcp",
+            "localport": local_port,
+            "remoteport": remote_port,
+            "encryption": false,
+            "compression": false,
+            "extraparams": "",
+        });
+        let create_resp = client
+            .post(create_url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Content-Type", "application/json")
+            .json(&create_body)
+            .send()
+            .await
+            .map_err(|e| format!("创建隧道失败: {}", e))?;
+        let create_status = create_resp.status();
+        let create_data: serde_json::Value = create_resp
+            .json()
+            .await
+            .map_err(|e| format!("解析创建隧道响应失败: {}", e))?;
+        if create_status.is_success()
+            && create_data.get("code").and_then(|v| v.as_u64()) == Some(200)
+        {
+            selected = Some((remote_port, tunnel_name));
+            break;
+        }
 
-    let create_data: serde_json::Value = create_resp
-        .json()
-        .await
-        .map_err(|e| format!("解析创建隧道响应失败: {}", e))?;
-
-    if create_data.get("code").and_then(|v| v.as_u64()) != Some(200) {
         let msg = create_data
             .get("msg")
             .and_then(|v| v.as_str())
             .unwrap_or("未知错误");
-        return Err(format!("创建隧道失败: {}", msg));
+        let error = format!("创建隧道失败: {}", msg);
+        if !is_remote_port_conflict(&error) {
+            return Err(if create_status.is_success() {
+                error
+            } else {
+                format!("{}（HTTP {}）", error, create_status)
+            });
+        }
+        warn!(
+            "[e2e] 远程端口 {} 已占用，第 {}/{} 次更换端口",
+            remote_port,
+            attempt + 1,
+            candidates.len()
+        );
     }
+    let (remote_port, tunnel_name) = selected.ok_or_else(|| {
+        format!(
+            "创建隧道失败: 连续 {} 个远程端口均已被占用",
+            candidates.len()
+        )
+    })?;
 
     // 4. 查询隧道列表获取隧道 ID
     let tunnels_url = "https://cf-v2.uapis.cn/tunnel";
@@ -507,15 +575,12 @@ async fn create_temp_tunnel(
         actual_remote_port,
         node_token,
         server_port,
+        tunnel_name,
     ))
 }
 
 /// 删除隧道（chmlfrp API 只认 accessToken，先用 proxy_token 换取）
-async fn delete_tunnel(
-    backend_url: &str,
-    proxy_token: &str,
-    tunnel_id: i64,
-) -> Result<(), String> {
+async fn delete_tunnel(backend_url: &str, proxy_token: &str, tunnel_id: i64) -> Result<(), String> {
     let access_token = super::auth::ensure_access_token(backend_url, proxy_token)
         .await
         .map_err(|e| e.user_message())?;
@@ -556,6 +621,8 @@ async fn delete_tunnel(
 
 /// 启动 frpc 子进程
 fn start_frpc(
+    frpc_path: &std::path::Path,
+    data_dir: &str,
     node_ip: &str,
     server_port: u16,
     node_token: &str,
@@ -563,11 +630,8 @@ fn start_frpc(
     remote_port: u16,
     tunnel_name: &str,
 ) -> Result<u32, String> {
-    // 查找 frpc 二进制
-    let frpc_path = which_frpc()?;
-
-    // 生成临时配置文件
-    let config_dir = std::env::temp_dir();
+    let config_dir = std::path::Path::new(data_dir).join("e2e");
+    std::fs::create_dir_all(&config_dir).map_err(|e| format!("创建frpc配置目录失败: {}", e))?;
     let config_path = config_dir.join(format!("e2e_frpc_{}.toml", std::process::id()));
 
     let config_content = format!(
@@ -589,7 +653,7 @@ remote_port = {}
         .map_err(|e| format!("写入frpc配置失败: {}", e))?;
 
     // 启动 frpc 子进程
-    let child = std::process::Command::new(&frpc_path)
+    let child = std::process::Command::new(frpc_path)
         .arg("-c")
         .arg(&config_path)
         .stdout(std::process::Stdio::null())
@@ -602,6 +666,9 @@ remote_port = {}
     // 保存 PID 和配置路径
     if let Ok(mut guard) = FRPC_PID.lock() {
         *guard = Some(pid);
+    }
+    if let Ok(mut guard) = FRPC_CONFIG_PATH.lock() {
+        *guard = Some(config_path);
     }
 
     // 注意：不等待 child，让它后台运行
@@ -634,35 +701,11 @@ fn stop_frpc() {
         }
     }
 
-    // 清理配置文件
-    let config_path = std::env::temp_dir().join(format!("e2e_frpc_{}.toml", std::process::id()));
-    let _ = std::fs::remove_file(&config_path);
-}
-
-/// 查找系统中的 frpc 二进制
-fn which_frpc() -> Result<std::path::PathBuf, String> {
-    // 常见路径
-    let candidates = [
-        "/usr/local/bin/frpc",
-        "/usr/bin/frpc",
-        "/opt/frpc/frpc",
-        "frpc",
-    ];
-
-    for candidate in &candidates {
-        let path = std::path::PathBuf::from(candidate);
-        if path.exists()
-            || std::process::Command::new("which")
-                .arg("frpc")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        {
-            return Ok(path);
+    if let Ok(mut guard) = FRPC_CONFIG_PATH.lock() {
+        if let Some(config_path) = guard.take() {
+            let _ = std::fs::remove_file(config_path);
         }
     }
-
-    Err("未找到 frpc 二进制，请安装 frpc 到 /usr/local/bin/frpc 或 /usr/bin/frpc".to_string())
 }
 
 /// 解析端口范围
@@ -716,6 +759,15 @@ pub async fn handle_setup(
     let proxy_token = ctx.proxy_token.clone();
     let backend_url = ctx.backend_url.clone();
 
+    let frpc_path = match crate::frpc::ensure_frpc(&ctx.data_dir).await {
+        Ok(path) => path,
+        Err(error) => {
+            complete_run(&ctx.account_id, &p.run_id, generation);
+            return Err(super::RpcError::new("FRPC_PREPARE_FAILED", error));
+        }
+    };
+    info!("[e2e_setup] frpc 已就绪: {}", frpc_path.display());
+
     // 2. 启动 TCP 测速服务端
     let tcp_port = match start_e2e_tcp_server() {
         Ok(port) => port,
@@ -728,7 +780,7 @@ pub async fn handle_setup(
     info!("[e2e_setup] TCP 服务端端口: {}", tcp_port);
 
     // 3. 创建临时隧道
-    let (tunnel_id, node_ip, remote_port, node_token, server_port) =
+    let (tunnel_id, node_ip, remote_port, node_token, server_port, tunnel_name) =
         match create_temp_tunnel(&backend_url, &proxy_token, &p.node_name, tcp_port).await {
             Ok(result) => result,
             Err(error) => {
@@ -756,8 +808,9 @@ pub async fn handle_setup(
     );
 
     // 4. 启动 frpc
-    let tunnel_name = format!("e2etest_{}_{}", chrono_timestamp(), remote_port);
     if let Err(e) = start_frpc(
+        &frpc_path,
+        &ctx.data_dir,
         &node_ip,
         server_port,
         &node_token,

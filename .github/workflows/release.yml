@@ -92,15 +92,13 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## v0.3.13 更新汇总
+            ## v0.3.14 更新汇总
+
+            ### 新增功能
+            - **自动准备 frpc**：服务端测速时自动复用或下载当前系统架构对应的 frpc，下载完成后校验文件完整性，无需手动安装。
 
             ### Bug 修复
-            - **重新授权/远程修改配置报「Read-only file system (os error 30)」**：修复 systemd 服务沙箱未放行配置目录导致的配置写入失败。`ProtectSystem=strict` 使 `/etc` 整体挂载只读，重新授权（写 config.toml 替换令牌）、添加/修改账号、修改后端地址等操作全部失败。现将 `/etc/chmlfrp-toolbox-daemon` 加入 `ReadWritePaths`（与目录 770/文件 660 的权限设计保持一致）。
-              - service 文件随包更新，安装后自动 daemon-reload + 重启生效
-              - 同时为远程更新链路补充 `systemctl daemon-reload` 免密规则，确保升级后新沙箱配置可靠生效
-
-            ### 升级说明
-            - v0.3.10 及以上版本可通过「更新管理」远程自动更新到本版本。
+            - **远程端口占用**：创建测速隧道遇到远程端口已被占用时，自动更换端口重试，最多尝试 5 次。
 
           files: |
             release/*.deb

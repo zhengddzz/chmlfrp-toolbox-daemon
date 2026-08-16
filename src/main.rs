@@ -6,6 +6,7 @@
 mod commands;
 mod config;
 mod db;
+mod frpc;
 mod logs;
 mod relay;
 mod telemetry;
