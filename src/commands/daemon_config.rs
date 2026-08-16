@@ -114,6 +114,61 @@ pub struct SetBackendUrlParams {
     pub backend_url: String,
 }
 
+/// 远程重新授权：用新的 proxy_token 替换当前连接账号的令牌
+///
+/// 流程（桌面客户端「重新授权」按钮触发）：
+/// 1. 用新 token 调后端 /auth/refresh 校验有效性
+/// 2. 按 ctx.proxy_token（旧 token）定位配置条目并替换
+/// 3. 清空 accessToken 缓存，返回成功
+/// 4. relay 层收到成功响应后断开连接，用新 token 自动重连
+#[derive(Deserialize)]
+pub struct UpdateProxyTokenParams {
+    #[serde(rename = "proxyToken")]
+    pub proxy_token: String,
+}
+
+pub async fn update_proxy_token(params: &serde_json::Value, ctx: &CommandContext) -> CommandResult {
+    let p: UpdateProxyTokenParams = serde_json::from_value(params.clone())
+        .map_err(|e| RpcError::new("INVALID_PARAMS", e.to_string()))?;
+
+    let new_token = p.proxy_token.trim().to_string();
+    if new_token.is_empty() {
+        return Err(RpcError::new("INVALID_PARAMS", "proxyToken 不能为空"));
+    }
+    if new_token == ctx.proxy_token {
+        return Err(RpcError::new(
+            "TOKEN_UNCHANGED",
+            "新令牌与当前令牌相同，无需更新",
+        ));
+    }
+
+    // 1. 校验新 token 有效性（调后端 /auth/refresh）
+    if let Err(e) = super::auth::validate_proxy_token(&ctx.backend_url, &new_token).await {
+        return Err(RpcError::new(&e.code, format!("新令牌校验失败: {}", e.message)));
+    }
+
+    // 2. 替换配置中的旧 token（account_id 为 0-based 索引字符串）
+    let fallback_index = ctx
+        .account_id
+        .parse::<usize>()
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let path = Path::new(&ctx.config_path);
+    config::replace_account_token(path, &ctx.proxy_token, &new_token, fallback_index)
+        .map_err(|e| RpcError::new("CONFIG_SAVE_FAILED", e.to_string()))?;
+
+    // 3. 清空新旧 token 的 accessToken 缓存
+    super::auth::invalidate_cache(&ctx.proxy_token).await;
+    super::auth::invalidate_cache(&new_token).await;
+
+    tracing::info!("[update_proxy_token] 令牌已热更新，即将使用新令牌重连");
+
+    Ok(serde_json::json!({
+        "success": true,
+        "message": "令牌已更新，正在使用新令牌重连"
+    }))
+}
+
 pub async fn set_backend_url(params: &serde_json::Value, ctx: &CommandContext) -> CommandResult {
     let p: SetBackendUrlParams = serde_json::from_value(params.clone())
         .map_err(|e| RpcError::new("INVALID_PARAMS", e.to_string()))?;

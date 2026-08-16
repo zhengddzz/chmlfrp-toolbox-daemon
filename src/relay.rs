@@ -119,6 +119,10 @@ pub async fn run_multi_tenant(cfg: Config, config_path: String) -> anyhow::Resul
 }
 
 /// 运行单个 account 的 WebSocket 连接（含重连）
+///
+/// 每次重连前重读配置文件，获取该账号（按 idx 定位）的最新 proxy_token，
+/// 支持 update_proxy_token 命令热更新令牌后自动用新令牌重连。
+#[allow(clippy::too_many_arguments)]
 async fn run_single_account(
     idx: usize,
     account: AccountConfig,
@@ -129,7 +133,33 @@ async fn run_single_account(
     data_dir: String,
     config_path: String,
 ) {
+    let mut current_token = account.proxy_token.clone();
     loop {
+        // 重读配置：令牌可能已被 update_proxy_token 命令热更新
+        // 配置读取失败时沿用上次的 account 继续重试（可能是临时 IO 错误）
+        let account = match load_account_at(&config_path, idx) {
+            Ok(Some(acc)) => acc,
+            Ok(None) => {
+                info!("[account {}] 账号已从配置移除，停止连接任务", idx);
+                break;
+            }
+            Err(e) => {
+                warn!("[account {}] 重读配置失败: {}，沿用当前令牌重连", idx, e);
+                AccountConfig {
+                    proxy_token: current_token.clone(),
+                    device_name: account.device_name.clone(),
+                }
+            }
+        };
+        if account.proxy_token != current_token {
+            info!(
+                "[account {}] 检测到 proxy_token 已更新（前 8 位 {}...），使用新令牌重连",
+                idx,
+                &account.proxy_token[..account.proxy_token.len().min(8)]
+            );
+            current_token = account.proxy_token.clone();
+        }
+
         match connect_and_run(
             idx,
             &account,
@@ -159,7 +189,19 @@ async fn run_single_account(
     }
 }
 
+/// 读取配置中 idx 位置的账号（idx 为 0-based）
+///
+/// - `Ok(Some(acc))`：账号存在，返回最新配置
+/// - `Ok(None)`：账号已被删除（索引越界）
+/// - `Err(e)`：配置文件读取/解析失败（调用方可沿用旧配置重试）
+fn load_account_at(config_path: &str, idx: usize) -> anyhow::Result<Option<AccountConfig>> {
+    let path = std::path::Path::new(config_path);
+    let cfg = crate::config::load_config(path)?;
+    Ok(cfg.accounts.get(idx).cloned())
+}
+
 /// 连接 WebSocket 并处理消息
+#[allow(clippy::too_many_arguments)]
 async fn connect_and_run(
     idx: usize,
     account: &AccountConfig,
@@ -200,12 +242,23 @@ async fn connect_and_run(
     // 进度推送通道（speedtest 等长任务使用）
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<ProgressPayload>();
     let (response_tx, mut response_rx) = mpsc::unbounded_channel::<String>();
+    // 重连信号（update_proxy_token 成功后触发，响应发完后断开并用新令牌重连）
+    let (reconnect_tx, mut reconnect_rx) = mpsc::unbounded_channel::<()>();
 
     // 进度推送上下文（共享给命令处理器）
     let ctx_progress_tx = Arc::new(Mutex::new(Some(progress_tx)));
 
     loop {
         tokio::select! {
+            // 令牌热更新：等待响应发出后断开重连（run_single_account 会用新令牌重连）
+            Some(_) = reconnect_rx.recv() => {
+                // 给 in-flight 的 rpc_response 留出发送窗口
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                info!("[account {}] proxy_token 已热更新，断开重连", idx);
+                let _ = write.send(Message::Close(None)).await;
+                return Err(anyhow::anyhow!("proxy_token 已更新，主动重连"));
+            }
+
             // 心跳
             _ = heartbeat.tick() => {
                 // 心跳超时检测：超过 HEARTBEAT_TIMEOUT 未收到 pong，主动断开重连
@@ -252,8 +305,10 @@ async fn connect_and_run(
                             config_path,
                             &account.proxy_token,
                             &idx.to_string(),
+                            backend_url,
                             &ctx_progress_tx,
                             &response_tx,
+                            &reconnect_tx,
                             &mut last_pong,
                         ).await {
                             warn!("[account {}] 处理消息出错: {}", idx, e);
@@ -284,6 +339,7 @@ async fn connect_and_run(
 }
 
 /// 处理收到的 WebSocket 消息
+#[allow(clippy::too_many_arguments)]
 async fn handle_message(
     text: &str,
     device_id: &str,
@@ -291,8 +347,10 @@ async fn handle_message(
     config_path: &str,
     proxy_token: &str,
     account_id: &str,
+    backend_url: &str,
     progress_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<ProgressPayload>>>>,
     response_tx: &mpsc::UnboundedSender<String>,
+    reconnect_tx: &mpsc::UnboundedSender<()>,
     last_pong: &mut Instant,
 ) -> anyhow::Result<()> {
     let msg: serde_json::Value =
@@ -321,8 +379,10 @@ async fn handle_message(
                 config_path,
                 proxy_token,
                 account_id,
+                backend_url,
                 progress_tx,
                 response_tx,
+                reconnect_tx,
             );
         }
         "rpc_cancel" => {
@@ -349,6 +409,7 @@ async fn handle_message(
                 config_path: config_path.to_string(),
                 proxy_token: proxy_token.to_string(),
                 account_id: account_id.to_string(),
+                backend_url: backend_url.to_string(),
                 user_id: None,
                 request_id: String::new(),
                 progress_tx: progress_tx.clone(),
@@ -367,6 +428,7 @@ async fn handle_message(
 }
 
 /// 处理 RPC 请求
+#[allow(clippy::too_many_arguments)]
 fn handle_rpc_request(
     msg: &serde_json::Value,
     device_id: &str,
@@ -374,8 +436,10 @@ fn handle_rpc_request(
     config_path: &str,
     proxy_token: &str,
     account_id: &str,
+    backend_url: &str,
     progress_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<ProgressPayload>>>>,
     response_tx: &mpsc::UnboundedSender<String>,
+    reconnect_tx: &mpsc::UnboundedSender<()>,
 ) {
     let request_id = msg
         .get("requestId")
@@ -403,13 +467,17 @@ fn handle_rpc_request(
         config_path: config_path.to_string(),
         proxy_token: proxy_token.to_string(),
         account_id: account_id.to_string(),
+        backend_url: backend_url.to_string(),
         user_id,
         request_id: request_id.clone(),
         progress_tx: progress_tx.clone(),
     };
     let response_tx = response_tx.clone();
+    let reconnect_tx = reconnect_tx.clone();
+    let is_token_update = command == "update_proxy_token";
     tokio::spawn(async move {
         let result = commands::dispatch(&command, &params, &ctx).await;
+        let succeeded = result.is_ok();
         let response = match result {
             Ok(data) => serde_json::json!({
                 "type": "rpc_response",
@@ -428,5 +496,10 @@ fn handle_rpc_request(
         };
         let _ = response_tx.send(response.to_string());
         info!("[rpc] 请求完成: {} command={}", request_id, command);
+
+        // 令牌更新成功后触发重连（连接层会先等响应发出再断开）
+        if is_token_update && succeeded {
+            let _ = reconnect_tx.send(());
+        }
     });
 }

@@ -92,16 +92,18 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## v0.3.10 更新汇总
+          ## v0.3.11 更新汇总
 
-            ### Bug 修复
-            - **远程更新安装失败（Read-only file system）**：修复服务沙箱（ProtectSystem=strict）导致 sudo 提权后 dpkg 仍无法写 /var/lib/dpkg 的问题。安装命令改为通过 systemd-run 在沙箱外以 root 执行，更新包下载路径迁移到数据目录 updates/（PrivateTmp 下 /tmp 对外部进程不可见）。
-            - **安装脚本**：修正 service 模板中 NoNewPrivileges=true 导致 sudo 完全失效的问题，并为已存在的旧 service 文件自动升级修正；sudoers 同步新增 systemd-run 免密规则。
+          ### Bug 修复
+          - **服务端到客户端测速提示「无效的登录状态」**：修复 daemon 直接用 proxy_token 调 chmlfrp API 导致的鉴权失败。现在与桌面客户端采用相同流程：先用 proxy_token 调后端 /auth/refresh 换取 accessToken（内存缓存 + 提前刷新 + 并发单飞），再用 accessToken 创建/删除测速隧道。
 
-            ### 升级说明
-            - 旧版本（≤ v0.3.9）无法通过远程自动更新修复此问题，请在服务器上重新运行安装脚本完成本次升级：
-              `curl -fsSL https://api.cct.zdzz.top/chmlfrp-toolbox-daemon/install.sh | sudo bash`
-              升级完成后的后续版本可正常自动更新。
+          ### 新功能
+          - **远程重新授权（热更新令牌）**：proxy_token 过期前可在「设备管理 → 远程管理 → 重新授权」中重新授权，桌面端完成浏览器 OAuth 后自动把新令牌通过 RPC 发送给 daemon；daemon 校验并写入配置后自动用新令牌重连，全程无需重启服务、无需手动改配置。
+            - 要求 daemon ≥ v0.3.11 且桌面客户端为配套新版本
+            - 设备已离线（令牌彻底过期断连）时仍需手动更新服务器配置
+
+          ### 升级说明
+          - v0.3.10 及以上版本可通过「更新管理」远程自动更新到本版本。
 
           files: |
             release/*.deb

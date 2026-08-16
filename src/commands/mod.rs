@@ -3,6 +3,7 @@
 //! 被 relay 调用，执行具体的远程命令。
 //! 所有命令返回 serde_json::Value，与 API 需求文档 6.1-6.5 对齐。
 
+pub mod auth;
 pub mod daemon_config;
 pub mod daemon_service;
 pub mod daemon_update;
@@ -136,6 +137,8 @@ pub struct CommandContext {
     pub config_path: String,
     pub proxy_token: String,
     pub account_id: String,
+    /// 后端地址（用于 /auth/refresh 等）
+    pub backend_url: String,
     /// 关联的 user_id（从 WebSocket 连接中获取，用于多租户隔离）
     pub user_id: Option<i64>,
     /// 当前 RPC 请求的 requestId（用于进度推送关联）
@@ -220,6 +223,7 @@ pub async fn dispatch(
         "daemon_modify_account" => daemon_config::modify_account(params, ctx).await,
         "daemon_delete_account" => daemon_config::delete_account(params, ctx).await,
         "daemon_set_backend_url" => daemon_config::set_backend_url(params, ctx).await,
+        "update_proxy_token" => daemon_config::update_proxy_token(params, ctx).await,
 
         "daemon_service_control" => daemon_service::service_control(params, ctx).await,
         "daemon_get_logs" => daemon_service::get_logs(params, ctx).await,

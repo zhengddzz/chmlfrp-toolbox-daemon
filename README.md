@@ -181,6 +181,29 @@ Daemon 支持多租户：一台服务器可同时被多个 qzhua 账号绑定。
 - 数据存储在 `/var/lib/chmlfrp-toolbox-daemon/users/<user_id>.db`
 - 用户通过桌面客户端「删除设备数据」时，仅删除该 user_id 的数据
 
+## 令牌与授权机制
+
+daemon 配置中的 `proxy_token` 为后端代理令牌（7 天有效期），**不能**直接调用 chmlfrp API（cf-v2.uapis.cn 只认 qzhua accessToken，直接用会报「无效的登录状态」）。
+
+### accessToken 自动刷新（v0.3.11+）
+
+与桌面客户端同款流程：调用 chmlfrp API（测速隧道创建/删除等）前，daemon 自动用 `proxy_token` 调后端 `POST /auth/refresh` 换取 accessToken：
+
+- 内存缓存，剩余有效期 > 60 秒直接复用，不重复请求（后端限流 5 次/分钟）
+- 并发调用单飞合并，避免重复刷新
+- 刷新失败按错误码分类提示：令牌过期 → 引导重新授权；限流 → 稍后重试
+
+### 远程重新授权（v0.3.11+）
+
+`proxy_token` 临近过期时，在桌面客户端「设备管理 → 远程管理 → 重新授权」操作：
+
+1. 桌面端打开浏览器完成 qzhua OAuth 授权，获取新 `proxy_token`
+2. 通过 relay RPC（`update_proxy_token` 命令）把新令牌发给 daemon
+3. daemon 校验新令牌（调 /auth/refresh）→ 按旧令牌定位并更新配置文件 → 清空 accessToken 缓存
+4. daemon 主动断开 relay 连接，用新令牌自动重连（约 3-5 秒），无需重启服务
+
+> 注意：设备已离线（令牌彻底过期导致断连）时无法远程更新，需在服务器上手动修改 `/etc/chmlfrp-toolbox-daemon/config.toml` 中的 `proxy_token` 后重启服务。
+
 ## 容器/受限环境适配
 
 安装脚本内置三级降级策略，确保在大多数环境下可正常安装：

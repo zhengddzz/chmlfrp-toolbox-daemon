@@ -338,11 +338,20 @@ fn parse_node_address(node_data: &serde_json::Value) -> Result<String, String> {
 }
 
 /// 调用 chmlfrp API 创建临时隧道
+///
+/// chmlfrp API 只认 qzhua accessToken，先用 proxy_token 调后端
+/// /auth/refresh 换取（带缓存，详见 auth.rs）
 async fn create_temp_tunnel(
+    backend_url: &str,
     proxy_token: &str,
     node_name: &str,
     local_port: u16,
 ) -> Result<(i64, String, u16, String, u16), String> {
+    // 0. 获取 accessToken（chmlfrp API 不认 proxy_token，直接用会报"无效的登录状态"）
+    let access_token = super::auth::ensure_access_token(backend_url, proxy_token)
+        .await
+        .map_err(|e| e.user_message())?;
+
     // 1. 获取节点信息
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -353,7 +362,7 @@ async fn create_temp_tunnel(
 
     let node_resp = client
         .get(&node_info_url)
-        .header("Authorization", format!("Bearer {}", proxy_token))
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
         .map_err(|e| format!("获取节点信息失败: {}", e))?;
@@ -429,7 +438,7 @@ async fn create_temp_tunnel(
     let create_url = "https://cf-v2.uapis.cn/create_tunnel";
     let create_resp = client
         .post(create_url)
-        .header("Authorization", format!("Bearer {}", proxy_token))
+        .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .json(&create_body)
         .send()
@@ -453,7 +462,7 @@ async fn create_temp_tunnel(
     let tunnels_url = "https://cf-v2.uapis.cn/tunnel";
     let tunnels_resp = client
         .get(tunnels_url)
-        .header("Authorization", format!("Bearer {}", proxy_token))
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
         .map_err(|e| format!("获取隧道列表失败: {}", e))?;
@@ -501,8 +510,16 @@ async fn create_temp_tunnel(
     ))
 }
 
-/// 删除隧道
-async fn delete_tunnel(proxy_token: &str, tunnel_id: i64) -> Result<(), String> {
+/// 删除隧道（chmlfrp API 只认 accessToken，先用 proxy_token 换取）
+async fn delete_tunnel(
+    backend_url: &str,
+    proxy_token: &str,
+    tunnel_id: i64,
+) -> Result<(), String> {
+    let access_token = super::auth::ensure_access_token(backend_url, proxy_token)
+        .await
+        .map_err(|e| e.user_message())?;
+
     let url = format!(
         "https://cf-v2.uapis.cn/delete_tunnel?tunnelid={}",
         tunnel_id
@@ -515,7 +532,7 @@ async fn delete_tunnel(proxy_token: &str, tunnel_id: i64) -> Result<(), String> 
 
     let resp = client
         .get(&url)
-        .header("Authorization", format!("Bearer {}", proxy_token))
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await
         .map_err(|e| format!("删除隧道请求失败: {}", e))?;
@@ -697,6 +714,7 @@ pub async fn handle_setup(
         ));
     }
     let proxy_token = ctx.proxy_token.clone();
+    let backend_url = ctx.backend_url.clone();
 
     // 2. 启动 TCP 测速服务端
     let tcp_port = match start_e2e_tcp_server() {
@@ -711,7 +729,7 @@ pub async fn handle_setup(
 
     // 3. 创建临时隧道
     let (tunnel_id, node_ip, remote_port, node_token, server_port) =
-        match create_temp_tunnel(&proxy_token, &p.node_name, tcp_port).await {
+        match create_temp_tunnel(&backend_url, &proxy_token, &p.node_name, tcp_port).await {
             Ok(result) => result,
             Err(error) => {
                 stop_e2e_tcp_server();
@@ -721,7 +739,7 @@ pub async fn handle_setup(
         };
 
     if super::is_run_cancelled(&ctx.account_id, &p.run_id, generation) {
-        let _ = delete_tunnel(&proxy_token, tunnel_id).await;
+        let _ = delete_tunnel(&backend_url, &proxy_token, tunnel_id).await;
         stop_e2e_tcp_server();
         complete_run(&ctx.account_id, &p.run_id, generation);
         return Err(super::RpcError::new("CANCELLED", "测速已强制停止"));
@@ -748,7 +766,7 @@ pub async fn handle_setup(
         &tunnel_name,
     ) {
         // frpc 启动失败，清理隧道
-        let _ = delete_tunnel(&proxy_token, tunnel_id).await;
+        let _ = delete_tunnel(&backend_url, &proxy_token, tunnel_id).await;
         stop_e2e_tcp_server();
         complete_run(&ctx.account_id, &p.run_id, generation);
         return Err(super::RpcError::new("EXEC_FAILED", e));
@@ -760,7 +778,7 @@ pub async fn handle_setup(
         .unwrap_or(false);
     if !ready {
         stop_frpc();
-        let _ = delete_tunnel(&proxy_token, tunnel_id).await;
+        let _ = delete_tunnel(&backend_url, &proxy_token, tunnel_id).await;
         stop_e2e_tcp_server();
         complete_run(&ctx.account_id, &p.run_id, generation);
         return Err(super::RpcError::new("CANCELLED", "测速资源已进入清理流程"));
@@ -828,7 +846,7 @@ pub async fn handle_cleanup(
     };
 
     if let Some(tid) = tunnel_id {
-        if let Err(error) = delete_tunnel(&ctx.proxy_token, tid).await {
+        if let Err(error) = delete_tunnel(&ctx.backend_url, &ctx.proxy_token, tid).await {
             if let Ok(mut coordinator) = RESOURCE_COORDINATOR.lock() {
                 coordinator.abort_cleanup(&ctx.account_id, run_id, generation);
             }

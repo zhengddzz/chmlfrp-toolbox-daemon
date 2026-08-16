@@ -195,6 +195,42 @@ pub fn delete_account(path: &Path, index: usize) -> anyhow::Result<()> {
     save_config(path, &cfg)
 }
 
+/// 按 token 替换账号的 proxy_token（用于远程重新授权）
+///
+/// 优先按 old_token 精确匹配；找不到（token 刚被替换的竞态场景）则回退
+/// 按 fallback_index（1-based）匹配。返回替换后的新 token 是否与旧值不同。
+pub fn replace_account_token(
+    path: &Path,
+    old_token: &str,
+    new_token: &str,
+    fallback_index: usize,
+) -> anyhow::Result<()> {
+    let mut cfg = load_config(path)?;
+    if cfg.accounts.is_empty() {
+        anyhow::bail!("配置中没有账号");
+    }
+
+    let target = cfg
+        .accounts
+        .iter()
+        .position(|a| a.proxy_token == old_token)
+        .or_else(|| {
+            // 回退按索引匹配（index 为 1-based）
+            if fallback_index >= 1 && fallback_index <= cfg.accounts.len() {
+                Some(fallback_index - 1)
+            } else {
+                None
+            }
+        });
+
+    let Some(idx) = target else {
+        anyhow::bail!("未找到要更新的账号（token 不匹配且索引无效）");
+    };
+
+    cfg.accounts[idx].proxy_token = new_token.to_string();
+    save_config(path, &cfg)
+}
+
 /// 修改后端地址
 pub fn set_backend_url(path: &Path, url: String) -> anyhow::Result<()> {
     let mut cfg = load_config(path)?;
@@ -269,6 +305,63 @@ pub fn get_effective_auto_update(config_path: &Path, data_dir: &str) -> bool {
     load_config(config_path)
         .map(|cfg| cfg.update.auto_update)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 写入临时配置文件并返回路径
+    fn write_test_config(tokens: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let mut content = r#"[server]
+backend_url = "wss://example.com"
+"#
+        .to_string();
+        for (token, name) in tokens {
+            content.push_str(&format!(
+                "\n[[accounts]]\nproxy_token = \"{}\"\ndevice_name = \"{}\"\n",
+                token, name
+            ));
+        }
+        let path = dir.path().join("config.toml");
+        fs::write(&path, &content).expect("写入测试配置失败");
+        (dir, path)
+    }
+
+    #[test]
+    fn replace_account_token_by_exact_match() {
+        let (_dir, path) = write_test_config(&[("old-token-1", "A"), ("token-2", "B")]);
+        replace_account_token(&path, "old-token-1", "new-token-1", 0).expect("替换失败");
+
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(cfg.accounts[0].proxy_token, "new-token-1");
+        assert_eq!(cfg.accounts[0].device_name, "A");
+        assert_eq!(cfg.accounts[1].proxy_token, "token-2");
+    }
+
+    #[test]
+    fn replace_account_token_falls_back_to_index() {
+        // 旧 token 已被替换的竞态场景：按 fallback_index（1-based）定位
+        let (_dir, path) = write_test_config(&[("changed-already", "A")]);
+        replace_account_token(&path, "stale-token", "new-token", 1).expect("替换失败");
+
+        let cfg = load_config(&path).unwrap();
+        assert_eq!(cfg.accounts[0].proxy_token, "new-token");
+    }
+
+    #[test]
+    fn replace_account_token_fails_without_match() {
+        let (_dir, path) = write_test_config(&[("token-1", "A")]);
+        assert!(replace_account_token(&path, "stale-token", "new-token", 0).is_err());
+        assert!(replace_account_token(&path, "stale-token", "new-token", 99).is_err());
+    }
+
+    #[test]
+    fn replace_account_token_fails_on_empty_accounts() {
+        let (_dir, path) = write_test_config(&[]);
+        assert!(replace_account_token(&path, "any", "new", 1).is_err());
+    }
 }
 
 /// 生成默认配置模板
