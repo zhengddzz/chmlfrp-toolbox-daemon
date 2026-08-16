@@ -92,11 +92,12 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## v0.3.12 更新汇总
+            ## v0.3.13 更新汇总
 
             ### Bug 修复
-            - **刷新 accessToken 报「builder error for url (wss://…)」**：修复 daemon 直接用 WebSocket 协议的后端地址（wss://）调 HTTP 接口 /auth/refresh 导致的请求构建失败。现在请求前自动将 wss:// 转为 https://、ws:// 转为 http://（与遥测上报逻辑一致）。
-              - 此问题导致 v0.3.11 的「远程重新授权」与「服务端到客户端测速」的令牌刷新完全不可用，请从 v0.3.11 升级到本版本
+            - **重新授权/远程修改配置报「Read-only file system (os error 30)」**：修复 systemd 服务沙箱未放行配置目录导致的配置写入失败。`ProtectSystem=strict` 使 `/etc` 整体挂载只读，重新授权（写 config.toml 替换令牌）、添加/修改账号、修改后端地址等操作全部失败。现将 `/etc/chmlfrp-toolbox-daemon` 加入 `ReadWritePaths`（与目录 770/文件 660 的权限设计保持一致）。
+              - service 文件随包更新，安装后自动 daemon-reload + 重启生效
+              - 同时为远程更新链路补充 `systemctl daemon-reload` 免密规则，确保升级后新沙箱配置可靠生效
 
             ### 升级说明
             - v0.3.10 及以上版本可通过「更新管理」远程自动更新到本版本。

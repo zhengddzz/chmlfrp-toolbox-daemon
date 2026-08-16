@@ -183,7 +183,8 @@ ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/rpm -U --force /tmp/${APP_NAME}_update
 # install 降级安装更新包（容器/受限环境下 dpkg 数据库只读时，解包直接替换二进制）
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/install -m 755 /tmp/${APP_NAME}_extract/usr/bin/${APP_NAME} /usr/bin/${APP_NAME}
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/install -m 755 /tmp/${APP_NAME}_extract/usr/bin/${APP_NAME} /usr/local/bin/${APP_NAME}
-# systemctl 服务控制（start/stop/restart）
+# systemctl 服务控制（start/stop/restart/daemon-reload）
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${APP_NAME}
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${APP_NAME}.service
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${APP_NAME}
@@ -249,7 +250,7 @@ StandardError=journal
 NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${DATA_DIR}
+ReadWritePaths=${DATA_DIR} ${CONFIG_DIR}
 PrivateTmp=true
 
 Environment=RUST_LOG=info
@@ -292,6 +293,20 @@ EOF
             systemctl daemon-reload 2>/dev/null || true
         fi
         info "已修正 service 配置: NoNewPrivileges=false（否则 sudo 无法提权）"
+    fi
+
+    # 升级旧版配置：ReadWritePaths 未包含配置目录时，远程修改配置会报
+    # "Read-only file system"（ProtectSystem=strict 使 /etc 整体只读，
+    # 目录 770/文件 660 的 DAC 权限无法越过挂载层只读）
+    if grep -q '^ReadWritePaths=' "$SERVICE_FILE" 2>/dev/null; then
+        if ! grep -qE "^ReadWritePaths=.*${CONFIG_DIR}" "$SERVICE_FILE" 2>/dev/null; then
+            sed -i "s|^ReadWritePaths=.*|ReadWritePaths=${DATA_DIR} ${CONFIG_DIR}|" "$SERVICE_FILE" 2>/dev/null
+            if command -v systemctl &>/dev/null; then
+                systemctl daemon-reload 2>/dev/null || true
+                systemctl restart "$APP_NAME" 2>/dev/null || true
+            fi
+            info "已修正 service 配置: ReadWritePaths 增加 ${CONFIG_DIR}（远程配置写入需要）"
+        fi
     fi
 }
 

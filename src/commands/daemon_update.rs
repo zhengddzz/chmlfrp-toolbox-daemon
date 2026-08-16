@@ -486,12 +486,20 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
     info!("[update] 安装完成，正在重启服务...");
 
     // 5. 重启服务（使用 sudo -n systemctl restart，避免 polkit 拦截）
+    // 先尝试 daemon-reload 使新安装的 service 文件（如 ReadWritePaths 变更）生效；
+    // 旧 sudoers 无 daemon-reload 规则时 sudo -n 失败，静默跳过，不影响重启
     send_progress(ctx, 90.0, "正在重启服务...").await;
 
     let restart_cmd = if is_root {
-        format!("sleep 1 && systemctl restart {}", APP_NAME)
+        format!(
+            "sleep 1; systemctl daemon-reload 2>/dev/null; systemctl restart {}",
+            APP_NAME
+        )
     } else {
-        format!("sleep 1 && sudo -n systemctl restart {}", APP_NAME)
+        format!(
+            "sleep 1; sudo -n systemctl daemon-reload 2>/dev/null; sudo -n systemctl restart {}",
+            APP_NAME
+        )
     };
 
     std::process::Command::new("sh")

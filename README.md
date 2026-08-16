@@ -216,12 +216,14 @@ daemon 配置中的 `proxy_token` 为后端代理令牌（7 天有效期），**
 
 ## 远程更新机制
 
-Daemon 服务运行在 systemd 沙箱中（`ProtectSystem=strict` + `PrivateTmp` + `ReadWritePaths=/var/lib/chmlfrp-toolbox-daemon`），远程更新的执行链路专门适配了该沙箱：
+Daemon 服务运行在 systemd 沙箱中（`ProtectSystem=strict` + `PrivateTmp` + `ReadWritePaths=/var/lib/chmlfrp-toolbox-daemon /etc/chmlfrp-toolbox-daemon`），远程更新的执行链路专门适配了该沙箱：
 
-1. **下载**：更新包下载到数据目录 `updates/`（沙箱内唯一可写且对外可见的路径；`PrivateTmp` 使 daemon 的 `/tmp` 对沙箱外进程不可见）
+1. **下载**：更新包下载到数据目录 `updates/`（沙箱内可写且对外可见的路径之一；`PrivateTmp` 使 daemon 的 `/tmp` 对沙箱外进程不可见）
 2. **安装**：通过 `systemd-run --wait --pipe --quiet` 在系统 manager 中启动 transient unit 执行 `dpkg -i` / `rpm -U`。**不能**直接 `sudo dpkg`：sudo 提权后的子进程仍处于服务的只读 mount namespace，dpkg 写 `/var/lib/dpkg` 会报 `Read-only file system`
 3. **降级链**：dpkg 失败 → `apt-get install -f` 修复依赖 → `dpkg-deb -x` 解包直接替换二进制（适配容器等无 dpkg 数据库环境）
-4. **重启**：`systemctl restart`（D-Bus 通信，不受文件系统沙箱影响）
+4. **重启**：先尝试 `systemctl daemon-reload`（使新安装的 service 文件生效）再 `systemctl restart`（D-Bus 通信，不受文件系统沙箱影响）
+
+配置目录 `/etc/chmlfrp-toolbox-daemon`（目录 770、文件 660、属组 daemon）在 `ReadWritePaths` 中放行，供远程修改配置（重新授权、账号管理、后端地址）直接写入 `config.toml`。
 
 sudoers 免密规则由安装脚本生成（`/etc/sudoers.d/chmlfrp-toolbox-daemon`），规则参数顺序与 daemon 源码 `build_escalated_cmd` 逐字对应。
 
