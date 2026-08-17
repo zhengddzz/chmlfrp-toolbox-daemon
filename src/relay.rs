@@ -213,12 +213,13 @@ async fn connect_and_run(
     config_path: &str,
 ) -> anyhow::Result<()> {
     // 构建 WebSocket URL
-    // wss://api.cct.zdzz.top/api/devices/ws?token=xxx&deviceId=xxx&deviceType=daemon&osInfo=xxx&hostname=xxx&interconnect=1
+    // wss://api.cct.zdzz.top/api/devices/ws?token=xxx&deviceId=xxx&deviceType=daemon&deviceName=xxx&osInfo=xxx&hostname=xxx&interconnect=1
     let ws_url = format!(
-        "{}/api/devices/ws?token={}&deviceId={}&deviceType=daemon&osInfo={}&hostname={}&interconnect=1&capabilities={}",
+        "{}/api/devices/ws?token={}&deviceId={}&deviceType=daemon&deviceName={}&osInfo={}&hostname={}&interconnect=1&capabilities={}",
         backend_url,
         urlencoding::encode(&account.proxy_token),
         device_id,
+        urlencoding::encode(&account.device_name),
         urlencoding::encode(os_info),
         urlencoding::encode(hostname),
         urlencoding::encode("{\"dns_failover_probe\":1,\"full_chain_test\":2}"),

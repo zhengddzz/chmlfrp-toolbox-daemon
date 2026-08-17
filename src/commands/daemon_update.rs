@@ -24,6 +24,64 @@ use tracing::{info, warn};
 const UPDATE_API: &str = "https://u.zdzz.top/api/toolbox-daemon";
 const APP_NAME: &str = "chmlfrp-toolbox-daemon";
 
+/// 更新流程全局互斥锁：自动更新通知与手动更新共享，
+/// 防止并发任务争抢同一安装包路径 / 解压目录 / 包管理器锁
+static UPDATE_MUTEX: once_cell::sync::Lazy<tokio::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| tokio::sync::Mutex::new(()));
+
+/// 将 Rust ARCH 常量映射为更新源的架构标识；未知架构返回 None（禁止回退 x64）
+fn arch_key_for(arch: &str) -> Option<&'static str> {
+    match arch {
+        "x86_64" => Some("x64"),
+        "aarch64" => Some("arm64"),
+        _ => None,
+    }
+}
+
+/// 检查可执行文件是否存在于 PATH 中
+fn binary_exists(name: &str) -> bool {
+    std::env::var("PATH")
+        .map(|path_env| {
+            path_env.split(':').any(|dir| {
+                !dir.is_empty() && Path::new(dir).join(name).exists()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 检测当前系统首选包格式：存在 dpkg → deb；否则存在 rpm → rpm；均无 → None
+fn detect_preferred_format() -> Option<&'static str> {
+    if binary_exists("dpkg") {
+        Some("deb")
+    } else if binary_exists("rpm") {
+        Some("rpm")
+    } else {
+        None
+    }
+}
+
+/// 从更新源 linux 包列表中严格匹配架构与包格式的安装包
+///
+/// 不做跨架构兜底、不做跨格式兜底：RPM 系发行版绝不下载 deb，反之亦然，
+/// 否则会出现 CentOS 下载 deb 后调用不存在的 dpkg 导致更新失败。
+fn select_package(
+    packages: &[serde_json::Value],
+    arch_key: &str,
+    format: &str,
+) -> Option<(String, String)> {
+    packages.iter().find_map(|pkg| {
+        let pkg_format = pkg.get("format")?.as_str()?;
+        let pkg_arch = pkg.get("arch").and_then(|v| v.as_str()).unwrap_or("");
+        let url = pkg.get("url")?.as_str()?;
+        let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
+        if pkg_format == format && pkg_arch == arch_key {
+            Some((url.to_string(), hash.to_string()))
+        } else {
+            None
+        }
+    })
+}
+
 /// 获取当前 Daemon 版本
 fn get_current_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -154,64 +212,30 @@ pub async fn check_update(_ctx: &CommandContext) -> CommandResult {
         .unwrap_or("")
         .to_string();
 
-    // 从 platforms.linux 数组中查找适合当前架构的 deb/rpm 包
-    let arch = std::env::consts::ARCH;
-    let arch_key = match arch {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        _ => "x64",
+    // 严格匹配当前架构与当前包管理器（dpkg→deb / rpm→rpm），
+    // 禁止跨架构回退（如 arm64 机器装 x64 包）与跨发行版回退（如 CentOS 装 deb）
+    let Some(arch_key) = arch_key_for(std::env::consts::ARCH) else {
+        return Err(RpcError::new(
+            "UNSUPPORTED_ARCH",
+            format!("不支持的 CPU 架构: {}，请使用安装脚本手动更新", std::env::consts::ARCH),
+        ));
+    };
+
+    let Some(preferred_format) = detect_preferred_format() else {
+        return Err(RpcError::new(
+            "UNSUPPORTED_PACKAGE_MANAGER",
+            "当前系统未找到 dpkg 或 rpm，无法远程更新，请使用安装脚本手动更新",
+        ));
     };
 
     let linux_packages = update_info
         .get("platforms")
         .and_then(|p| p.get("linux"))
-        .and_then(|l| l.as_array());
+        .and_then(|l| l.as_array())
+        .cloned()
+        .unwrap_or_default();
 
-    // 优先匹配 deb 包，其次 rpm 包
-    let (download_url, sha256) = linux_packages
-        .and_then(|packages| {
-            // 第一轮：精确匹配架构 + deb 格式
-            packages
-                .iter()
-                .find_map(|pkg| {
-                    let format = pkg.get("format").and_then(|v| v.as_str())?;
-                    let pkg_arch = pkg.get("arch").and_then(|v| v.as_str()).unwrap_or("");
-                    let url = pkg.get("url").and_then(|v| v.as_str())?;
-                    let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-                    if format == "deb" && pkg_arch == arch_key {
-                        Some((url.to_string(), hash.to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    // 第二轮：精确匹配架构 + rpm 格式
-                    packages.iter().find_map(|pkg| {
-                        let format = pkg.get("format").and_then(|v| v.as_str())?;
-                        let pkg_arch = pkg.get("arch").and_then(|v| v.as_str()).unwrap_or("");
-                        let url = pkg.get("url").and_then(|v| v.as_str())?;
-                        let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-                        if format == "rpm" && pkg_arch == arch_key {
-                            Some((url.to_string(), hash.to_string()))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .or_else(|| {
-                    // 第三轮：任意架构 + deb 格式
-                    packages.iter().find_map(|pkg| {
-                        let format = pkg.get("format").and_then(|v| v.as_str())?;
-                        let url = pkg.get("url").and_then(|v| v.as_str())?;
-                        let hash = pkg.get("sha256").and_then(|v| v.as_str()).unwrap_or("");
-                        if format == "deb" {
-                            Some((url.to_string(), hash.to_string()))
-                        } else {
-                            None
-                        }
-                    })
-                })
-        })
+    let (download_url, sha256) = select_package(&linux_packages, arch_key, preferred_format)
         .unwrap_or_default();
 
     let has_update = version_gt(&latest_version, &current);
@@ -225,6 +249,8 @@ pub async fn check_update(_ctx: &CommandContext) -> CommandResult {
         "publishedAt": published_at,
         "downloadUrl": download_url,
         "sha256": sha256,
+        "packageFormat": preferred_format,
+        "packageAvailable": !download_url.is_empty(),
         "hasUpdate": has_update,
     }))
 }
@@ -236,6 +262,15 @@ pub async fn check_update(_ctx: &CommandContext) -> CommandResult {
 /// 安装步骤通过 systemd-run 在沙箱外以 root 执行（安装脚本已配置 sudoers 免密规则）。
 pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
     info!("[update] 开始执行更新流程");
+
+    // 全局互斥：自动更新通知与手动更新可能同时触发，
+    // 已有更新任务在执行时直接拒绝，不排队等待（避免重复下载与包管理器锁争抢）
+    let Ok(_update_guard) = UPDATE_MUTEX.try_lock() else {
+        return Err(RpcError::new(
+            "UPDATE_IN_PROGRESS",
+            "已有更新任务正在执行，请等待其完成后再试",
+        ));
+    };
 
     send_progress(ctx, 5.0, "正在检查版本信息...").await;
 
@@ -406,76 +441,113 @@ pub async fn perform_update(ctx: &CommandContext) -> CommandResult {
         info!("[update] 更新源未提供 SHA-256，跳过校验");
     }
 
-    // 4. 安装（通过 systemd-run 逃逸 ProtectSystem=strict 沙箱执行，详见 build_escalated_cmd）
-    let install_cmd_desc = if is_deb { "dpkg -i" } else { "rpm -U --force" };
-    send_progress(ctx, 70.0, &format!("正在安装 ({}...)...", install_cmd_desc)).await;
+    // 4. 安装：
+    //    优先使用安全更新助手（root 管理的固定入口，sudoers 仅放行该助手，
+    //    由助手校验路径/文件名/SHA-256/包名/包架构并复制到 root 暂存区防 TOCTOU）；
+    //    旧环境未部署助手时回退 dpkg/rpm 直装（建议重跑安装脚本启用安全模式）
+    const SECURE_UPDATE_HELPER: &str = "/usr/lib/chmlfrp-toolbox-daemon/secure-update-helper.sh";
 
-    let install_args: Vec<String> = if is_deb {
-        vec!["-i".to_string(), pkg_path.clone()]
-    } else {
-        vec![
-            "-U".to_string(),
-            "--force".to_string(),
-            pkg_path.clone(),
-        ]
-    };
-    let mut install_cmd = build_escalated_cmd(
-        if is_deb { "dpkg" } else { "rpm" },
-        &install_args,
-        is_root,
-    );
-
-    let output = install_cmd
-        .output()
-        .map_err(|e| RpcError::new("INSTALL_FAILED", format!("执行安装命令失败: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        warn!("[update] 安装失败: stderr={}, stdout={}", stderr, stdout);
-
-        // deb 包尝试自动修复依赖；仍失败则降级为解包直接替换二进制（容器/受限环境）
-        if is_deb {
-            send_progress(ctx, 75.0, "安装失败，尝试修复依赖...").await;
-            info!("[update] 尝试修复依赖...");
-
-            let fix_args: Vec<String> = ["install", "-f", "-y"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            let fix_output = build_escalated_cmd("apt-get", &fix_args, is_root).output();
-
-            let fix_ok = matches!(&fix_output, Ok(fo) if fo.status.success());
-            if fix_ok && Path::new("/usr/bin").join(APP_NAME).exists() {
-                // 依赖修复成功且二进制已就位
-            } else {
-                send_progress(ctx, 78.0, "修复依赖失败，尝试降级安装（解包替换二进制）...").await;
-                info!("[update] 依赖修复失败，降级为手动解压安装...");
-                match manual_install_deb(&pkg_path, &updates_dir, is_root) {
-                    Ok(()) => {
-                        send_progress(ctx, 85.0, "降级安装成功").await;
-                    }
-                    Err(manual_err) => {
-                        let _ = std::fs::remove_file(&pkg_path);
-                        send_progress(ctx, 100.0, &format!("安装失败: {}", manual_err)).await;
-                        return Err(RpcError::new(
-                            "INSTALL_FAILED",
-                            format!(
-                                "dpkg 安装失败（{}）且降级安装失败: {}",
-                                stderr.trim(),
-                                manual_err
-                            ),
-                        ));
-                    }
-                }
-            }
+    if Path::new(SECURE_UPDATE_HELPER).exists() {
+        send_progress(ctx, 70.0, "正在通过安全更新助手安装...").await;
+        // 更新源提供了 sha256 时以源声明值为准（助手同时校验下载完整性与 TOCTOU），
+        // 否则使用本地计算的哈希（仅防 TOCTOU）
+        let sha_for_helper = if expected_sha256.is_empty() {
+            actual_sha256.as_str()
         } else {
+            expected_sha256
+        };
+        let helper_args: Vec<String> = vec![pkg_path.clone(), sha_for_helper.to_string()];
+        let helper_output = build_escalated_cmd(SECURE_UPDATE_HELPER, &helper_args, is_root)
+            .output()
+            .map_err(|e| RpcError::new("INSTALL_FAILED", format!("执行安全更新助手失败: {}", e)))?;
+
+        if !helper_output.status.success() {
+            let stderr = String::from_utf8_lossy(&helper_output.stderr);
+            warn!("[update] 安全更新助手安装失败: {}", stderr);
             let _ = std::fs::remove_file(&pkg_path);
             send_progress(ctx, 100.0, &format!("安装失败: {}", stderr.trim())).await;
             return Err(RpcError::new(
                 "INSTALL_FAILED",
-                format!("rpm 安装失败: {}", stderr),
+                format!("安全更新助手安装失败: {}", stderr.trim()),
             ));
+        }
+        info!("[update] 安全更新助手安装成功");
+    } else {
+        warn!(
+            "[update] 未找到安全更新助手 {}，回退 dpkg/rpm 直装模式（建议重新运行安装脚本启用安全更新）",
+            SECURE_UPDATE_HELPER
+        );
+
+        let install_cmd_desc = if is_deb { "dpkg -i" } else { "rpm -U --force" };
+        send_progress(ctx, 70.0, &format!("正在安装 ({}...)...", install_cmd_desc)).await;
+
+        let install_args: Vec<String> = if is_deb {
+            vec!["-i".to_string(), pkg_path.clone()]
+        } else {
+            vec![
+                "-U".to_string(),
+                "--force".to_string(),
+                pkg_path.clone(),
+            ]
+        };
+        let mut install_cmd = build_escalated_cmd(
+            if is_deb { "dpkg" } else { "rpm" },
+            &install_args,
+            is_root,
+        );
+
+        let output = install_cmd
+            .output()
+            .map_err(|e| RpcError::new("INSTALL_FAILED", format!("执行安装命令失败: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            warn!("[update] 安装失败: stderr={}, stdout={}", stderr, stdout);
+
+            // deb 包尝试自动修复依赖；仍失败则降级为解包直接替换二进制（容器/受限环境）
+            if is_deb {
+                send_progress(ctx, 75.0, "安装失败，尝试修复依赖...").await;
+                info!("[update] 尝试修复依赖...");
+
+                let fix_args: Vec<String> = ["install", "-f", "-y"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                let fix_output = build_escalated_cmd("apt-get", &fix_args, is_root).output();
+
+                let fix_ok = matches!(&fix_output, Ok(fo) if fo.status.success());
+                if fix_ok && Path::new("/usr/bin").join(APP_NAME).exists() {
+                    // 依赖修复成功且二进制已就位
+                } else {
+                    send_progress(ctx, 78.0, "修复依赖失败，尝试降级安装（解包替换二进制）...").await;
+                    info!("[update] 依赖修复失败，降级为手动解压安装...");
+                    match manual_install_deb(&pkg_path, &updates_dir, is_root) {
+                        Ok(()) => {
+                            send_progress(ctx, 85.0, "降级安装成功").await;
+                        }
+                        Err(manual_err) => {
+                            let _ = std::fs::remove_file(&pkg_path);
+                            send_progress(ctx, 100.0, &format!("安装失败: {}", manual_err)).await;
+                            return Err(RpcError::new(
+                                "INSTALL_FAILED",
+                                format!(
+                                    "dpkg 安装失败（{}）且降级安装失败: {}",
+                                    stderr.trim(),
+                                    manual_err
+                                ),
+                            ));
+                        }
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_file(&pkg_path);
+                send_progress(ctx, 100.0, &format!("安装失败: {}", stderr.trim())).await;
+                return Err(RpcError::new(
+                    "INSTALL_FAILED",
+                    format!("rpm 安装失败: {}", stderr),
+                ));
+            }
         }
     }
 
@@ -677,5 +749,72 @@ pub async fn handle_update_notification(ctx: &CommandContext, version: &str) {
         }
     } else {
         info!("[update] 收到更新通知 v{}，自动更新未开启，忽略", version);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{arch_key_for, select_package};
+    use serde_json::json;
+
+    fn sample_packages() -> Vec<serde_json::Value> {
+        vec![
+            json!({ "format": "deb", "arch": "x64", "url": "https://x64.deb", "sha256": "hash-x64-deb" }),
+            json!({ "format": "deb", "arch": "arm64", "url": "https://arm64.deb", "sha256": "hash-arm64-deb" }),
+            json!({ "format": "rpm", "arch": "x64", "url": "https://x64.rpm", "sha256": "hash-x64-rpm" }),
+            json!({ "format": "rpm", "arch": "arm64", "url": "https://arm64.rpm", "sha256": "hash-arm64-rpm" }),
+        ]
+    }
+
+    #[test]
+    fn maps_supported_architectures_only() {
+        assert_eq!(arch_key_for("x86_64"), Some("x64"));
+        assert_eq!(arch_key_for("aarch64"), Some("arm64"));
+        // 未知架构不再回退 x64，避免下载不可执行包
+        assert_eq!(arch_key_for("riscv64"), None);
+        assert_eq!(arch_key_for("mips"), None);
+    }
+
+    #[test]
+    fn selects_exact_arch_and_format_package() {
+        let packages = sample_packages();
+        assert_eq!(
+            select_package(&packages, "x64", "deb").unwrap(),
+            ("https://x64.deb".to_string(), "hash-x64-deb".to_string())
+        );
+        assert_eq!(
+            select_package(&packages, "arm64", "rpm").unwrap(),
+            ("https://arm64.rpm".to_string(), "hash-arm64-rpm".to_string())
+        );
+    }
+
+    #[test]
+    fn never_falls_back_across_arch_or_format() {
+        let packages = sample_packages();
+        // RPM 系发行版绝不能拿到 deb 包
+        assert!(select_package(&packages, "x64", "rpm").is_some());
+        // 只提供 deb 时，RPM 系应返回 None 而不是回退 deb
+        let deb_only: Vec<serde_json::Value> = vec![
+            json!({ "format": "deb", "arch": "x64", "url": "https://x64.deb", "sha256": "hash" }),
+        ];
+        assert!(select_package(&deb_only, "x64", "rpm").is_none());
+        // 架构缺失时不能回退其他架构
+        let arm_only: Vec<serde_json::Value> = vec![
+            json!({ "format": "deb", "arch": "arm64", "url": "https://arm64.deb", "sha256": "hash" }),
+        ];
+        assert!(select_package(&arm_only, "x64", "deb").is_none());
+    }
+
+    #[test]
+    fn skips_packages_missing_url_or_format() {
+        let packages = vec![
+            json!({ "format": "deb", "arch": "x64" }),
+            json!({ "format": "rpm", "arch": "x64", "url": "", "sha256": "hash" }),
+            json!({ "format": "deb", "arch": "x64", "url": "https://ok.deb", "sha256": "ok" }),
+        ];
+        assert_eq!(
+            select_package(&packages, "x64", "deb").unwrap(),
+            ("https://ok.deb".to_string(), "ok".to_string())
+        );
     }
 }

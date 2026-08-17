@@ -1065,7 +1065,23 @@ pub async fn handle_cleanup(
         .map(|mut coordinator| coordinator.begin_cleanup(&ctx.account_id, run_id, generation))
         .unwrap_or(false);
     if !cleaning_started {
-        return Ok(serde_json::json!({ "cleaned": false, "reason": "CLEANUP_IN_PROGRESS" }));
+        // 已有清理在进行：等待其完成（最多 15 秒），实现幂等语义，
+        // 避免客户端把并发清理误判为失败
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let still_active = RESOURCE_COORDINATOR
+                .lock()
+                .ok()
+                .and_then(|coordinator| coordinator.active_generation(&ctx.account_id, run_id))
+                .is_some();
+            if !still_active {
+                return Ok(serde_json::json!({ "cleaned": true, "reason": "ALREADY_CLEANED" }));
+            }
+            if Instant::now() >= deadline {
+                return Ok(serde_json::json!({ "cleaned": false, "reason": "CLEANUP_IN_PROGRESS" }));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 
     // 1. 停止 frpc

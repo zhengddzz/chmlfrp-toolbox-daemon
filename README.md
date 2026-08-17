@@ -113,6 +113,8 @@ device_name = "西安服务器-用户B"
 - **检查更新**：打开更新管理时自动通过 `u.zdzz.top` 获取最新版本，也可手动重新检查并一键安装
 - **自动更新**：可配置开关，开启后由后端推送触发自动更新
 
+设备名称以账号设备记录中的自定义名称为准，Daemon 重连时会携带配置中的名称用于首次注册，后续重连不会覆盖已保存名称。重装或卸载时请保留 `/var/lib/chmlfrp-toolbox-daemon/device_id`，否则会生成新的设备 ID，并被识别为新设备。
+
 服务端作为测速发送端时，Daemon 会按 `ip`、`realIp`、`real_IP` 顺序解析节点地址并跳过空值；节点接口返回鉴权失败、节点不存在等错误时，客户端会显示接口返回的具体原因。
 
 Daemon 会在首次需要建立测速隧道时自动准备 frpc：优先复用 `/usr/local/bin/frpc`、`/usr/bin/frpc` 等已有安装；系统未安装时，从与桌面客户端相同的 frpc 下载接口选择当前 Linux 架构版本，完成大小和 SHA-256 校验后保存到 `{data_dir}/bin/frpc`（默认 `/var/lib/chmlfrp-toolbox-daemon/bin/frpc`）。下载或校验失败不会留下可执行的半成品文件。
@@ -224,14 +226,15 @@ daemon 配置中的 `proxy_token` 为后端代理令牌（7 天有效期），**
 
 Daemon 服务运行在 systemd 沙箱中（`ProtectSystem=strict` + `PrivateTmp` + `ReadWritePaths=/var/lib/chmlfrp-toolbox-daemon /etc/chmlfrp-toolbox-daemon`），远程更新的执行链路专门适配了该沙箱：
 
-1. **下载**：更新包下载到数据目录 `updates/`（沙箱内可写且对外可见的路径之一；`PrivateTmp` 使 daemon 的 `/tmp` 对沙箱外进程不可见）
-2. **安装**：通过 `systemd-run --wait --pipe --quiet` 在系统 manager 中启动 transient unit 执行 `dpkg -i` / `rpm -U`。**不能**直接 `sudo dpkg`：sudo 提权后的子进程仍处于服务的只读 mount namespace，dpkg 写 `/var/lib/dpkg` 会报 `Read-only file system`
-3. **降级链**：dpkg 失败 → `apt-get install -f` 修复依赖 → `dpkg-deb -x` 解包直接替换二进制（适配容器等无 dpkg 数据库环境）
-4. **重启**：先尝试 `systemctl daemon-reload`（使新安装的 service 文件生效）再 `systemctl restart`（D-Bus 通信，不受文件系统沙箱影响）
+1. **互斥**：自动更新与手动更新同时触发时，后触发的请求直接被拒绝，避免重复下载与包管理器锁争抢
+2. **下载**：更新包下载到数据目录 `updates/`（沙箱内可写且对外可见的路径之一；`PrivateTmp` 使 daemon 的 `/tmp` 对沙箱外进程不可见）。只接受与当前架构（x64/arm64）和包格式（deb/rpm）严格匹配的安装包，拒绝跨架构、跨发行版回退
+3. **安全更新助手**（v0.3.16+，推荐）：通过 `systemd-run --wait --pipe --quiet` 在系统 manager 中启动 transient unit 执行 `/usr/lib/chmlfrp-toolbox-daemon/secure-update-helper.sh`。助手由 root 管理，校验包路径（仅限数据目录 `updates/`）、固定文件名、SHA-256、包名与包架构，并复制到 root 暂存区二次校验后再安装（防 TOCTOU）。**不能**直接 `sudo dpkg`：sudo 提权后的子进程仍处于服务的只读 mount namespace，dpkg 写 `/var/lib/dpkg` 会报 `Read-only file system`
+4. **回退链**：旧环境未部署助手时回退 `dpkg -i` / `rpm -U` 直装；dpkg 失败 → `apt-get install -f` 修复依赖 → `dpkg-deb -x` 解包直接替换二进制（适配容器等无 dpkg 数据库环境）
+5. **重启**：先尝试 `systemctl daemon-reload`（使新安装的 service 文件生效）再 `systemctl restart`（D-Bus 通信，不受文件系统沙箱影响）
 
 配置目录 `/etc/chmlfrp-toolbox-daemon`（目录 770、文件 660、属组 daemon）在 `ReadWritePaths` 中放行，供远程修改配置（重新授权、账号管理、后端地址）直接写入 `config.toml`。
 
-sudoers 免密规则由安装脚本生成（`/etc/sudoers.d/chmlfrp-toolbox-daemon`），规则参数顺序与 daemon 源码 `build_escalated_cmd` 逐字对应。
+sudoers 免密规则由安装脚本生成（`/etc/sudoers.d/chmlfrp-toolbox-daemon`），v0.3.16+ 仅放行安全更新助手与 systemctl 服务控制/journalctl 命令（不再直接放行 dpkg/rpm），规则参数顺序与 daemon 源码 `build_escalated_cmd` 逐字对应。
 
 ### 常见更新故障排查
 
@@ -239,6 +242,7 @@ sudoers 免密规则由安装脚本生成（`/etc/sudoers.d/chmlfrp-toolbox-daem
 |------|-----------|
 | `dpkg: unable to access the dpkg database directory /var/lib/dpkg: Read-only file system` | 旧版本（≤ v0.3.9）在沙箱内直接执行 dpkg 所致。在服务器上重新运行一键安装脚本升级到新版即可，后续更新走 systemd-run 不再复现 |
 | `sudo: a password is required` / `sudo: no tty present` | sudoers 规则缺失或参数不匹配（重新运行安装脚本），或 service 文件被改为 `NoNewPrivileges=true`（安装脚本会自动修正为 false） |
+| 日志提示"未找到安全更新助手，回退 dpkg/rpm 直装模式" | 服务器上的安装脚本版本较旧（≤ v0.3.15），未部署助手。重新运行一键安装脚本即可启用安全更新模式 |
 | `Running in chroot, ignoring request` / systemd-run 报 D-Bus 错误 | 无 systemd 的容器环境。daemon 会自动回退为直接执行 dpkg；若 dpkg 数据库同样只读，再降级为解包替换二进制 |
 
 ## 从源码构建

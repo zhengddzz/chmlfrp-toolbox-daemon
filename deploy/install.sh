@@ -148,8 +148,142 @@ create_user() {
     fi
 }
 
-# 配置 sudoers：允许 daemon 用户免密执行更新所需的特权命令
-# 仅在非 root 运行模式下配置（root 模式无需 sudo）
+# 部署安全更新助手：root 管理的固定提权入口，
+# 由助手自身校验更新包路径/文件名/SHA-256/包名/包架构后再安装，
+# 避免旧的 "sudoers 直接放行 dpkg/rpm + 数据目录可写" 提权风险
+install_secure_helper() {
+    local helper_dir="/usr/lib/${APP_NAME}"
+    local helper_file="${helper_dir}/secure-update-helper.sh"
+
+    if ! mkdir -p "$helper_dir" 2>/dev/null; then
+        warn "无法创建 $helper_dir，远程更新将回退直装模式"
+        return 0
+    fi
+
+    # 写入脚本内容（与 deploy/secure-update-helper.sh 保持一致）
+    if ! cat > "$helper_file" << 'HELPER_EOF'
+#!/bin/sh
+# chmlfrp-toolbox-daemon 安全更新助手（仅限 root 执行）
+#
+# 作用：作为 sudoers 唯一放行的提权入口，替代 daemon 直接调用 dpkg/rpm。
+# 安全校验：
+#   1. 仅接受固定更新目录、固定文件名的 deb/rpm 包
+#   2. 拒绝符号链接与路径越界
+#   3. SHA-256 校验（调用方传入期望值）
+#   4. 复制到 root 管理的暂存区后二次校验，防止校验后被替换（TOCTOU）
+#   5. 校验包名与包架构必须匹配当前系统
+#
+# 用法: secure-update-helper.sh <包文件> <期望sha256>
+set -eu
+
+ALLOWED_DIR="/var/lib/chmlfrp-toolbox-daemon/updates"
+PKG_NAME="chmlfrp-toolbox-daemon"
+
+log() { printf '[secure-update-helper] %s\n' "$*" >&2; }
+die() { log "错误: $*"; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "必须以 root 运行"
+[ "$#" -eq 2 ] || die "参数格式: $0 <包文件> <sha256>"
+
+pkg_file=$1
+expected_sha=$2
+
+# 1. 路径校验：必须是固定更新目录下的绝对路径
+case "$pkg_file" in
+  "$ALLOWED_DIR"/*) ;;
+  *) die "包文件必须位于 $ALLOWED_DIR" ;;
+esac
+
+# 2. 存在性校验 + 拒绝符号链接（真实路径也必须仍在允许目录内）
+[ -f "$pkg_file" ] || die "包文件不存在"
+real_path=$(readlink -f "$pkg_file" 2>/dev/null || true)
+[ -n "$real_path" ] || die "无法解析文件真实路径"
+case "$real_path" in
+  "$ALLOWED_DIR"/*) ;;
+  *) die "文件真实路径越界: $real_path" ;;
+esac
+[ "$real_path" = "$pkg_file" ] || die "拒绝符号链接路径"
+
+# 3. 文件名固定，杜绝执行任意文件
+base=$(basename "$real_path")
+case "$base" in
+  "${PKG_NAME}_update.deb"|"${PKG_NAME}_update.rpm") ;;
+  *) die "非法文件名: $base" ;;
+esac
+
+# 4. 原文件 SHA-256 校验
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_sha=$(sha256sum "$real_path" | awk '{print $1}')
+else
+  die "系统缺少 sha256sum 工具"
+fi
+[ "$actual_sha" = "$expected_sha" ] || die "SHA-256 校验失败: 期望 $expected_sha，实际 $actual_sha"
+
+# 5. 复制到 root 管理的暂存区，防止校验后原文件被 daemon 用户替换
+stage_dir=$(mktemp -d /tmp/chmlfrp-update.XXXXXX) || die "创建暂存目录失败"
+trap 'rm -rf "$stage_dir"' EXIT
+staged="$stage_dir/$base"
+cp -- "$real_path" "$staged" || die "复制包到暂存区失败"
+chown root:root "$staged"
+chmod 0644 "$staged"
+
+# 6. 暂存副本二次 SHA-256 校验
+staged_sha=$(sha256sum "$staged" | awk '{print $1}')
+[ "$staged_sha" = "$expected_sha" ] || die "暂存副本 SHA-256 校验失败"
+
+# 7. 包名与包架构校验
+arch=$(uname -m)
+case "$base" in
+  *.deb)
+    command -v dpkg-deb >/dev/null 2>&1 || die "系统缺少 dpkg-deb 工具"
+    pkg_arch=$(dpkg-deb -f "$staged" Architecture 2>/dev/null || true)
+    pkg_id=$(dpkg-deb -f "$staged" Package 2>/dev/null || true)
+    case "$arch:$pkg_arch" in
+      x86_64:amd64|aarch64:arm64) ;;
+      *) die "deb 包架构不匹配: 当前 $arch，包为 ${pkg_arch:-未知}" ;;
+    esac
+    [ "$pkg_id" = "$PKG_NAME" ] || die "deb 包名不匹配: ${pkg_id:-未知}"
+    ;;
+  *.rpm)
+    command -v rpm >/dev/null 2>&1 || die "系统缺少 rpm 工具"
+    pkg_arch=$(rpm -qp --queryformat '%{ARCH}' "$staged" 2>/dev/null || true)
+    pkg_id=$(rpm -qp --queryformat '%{NAME}' "$staged" 2>/dev/null || true)
+    case "$arch:$pkg_arch" in
+      x86_64:x86_64|aarch64:aarch64) ;;
+      *) die "rpm 包架构不匹配: 当前 $arch，包为 ${pkg_arch:-未知}" ;;
+    esac
+    [ "$pkg_id" = "$PKG_NAME" ] || die "rpm 包名不匹配: ${pkg_id:-未知}"
+    ;;
+esac
+
+# 8. 安装暂存副本（deb 依赖缺失时自动修复）
+case "$base" in
+  *.deb)
+    if ! dpkg -i -- "$staged"; then
+      apt-get install -f -y || die "dpkg 安装失败且依赖修复失败"
+    fi
+    ;;
+  *.rpm)
+    rpm -U --force -- "$staged" || die "rpm 安装失败"
+    ;;
+esac
+
+log "安全更新完成: $base"
+HELPER_EOF
+    then
+        warn "无法写入 $helper_file，远程更新将回退直装模式"
+        return 0
+    fi
+
+    chown root:root "$helper_file"
+    chmod 0755 "$helper_file"
+    success "安全更新助手已部署: $helper_file"
+}
+
+# 配置 sudoers：仅放行安全更新助手与服务控制命令（v0.3.16+ 收紧）
+# 旧的 dpkg/rpm/apt-get/install 直装规则已移除：
+# 数据目录归 daemon 用户可写，若同时放行从该目录安装软件包的命令，
+# 任何取得 daemon 用户权限的进程都能以 root 身份安装任意软件包（提权）。
 setup_sudoers() {
     # root 模式不需要 sudoers
     if [[ "$APP_USER" == "root" ]]; then
@@ -157,33 +291,22 @@ setup_sudoers() {
     fi
 
     local sudoers_file="/etc/sudoers.d/${APP_NAME}"
-    info "配置 sudoers 规则（允许 ${APP_USER} 免密执行更新命令）..."
+    info "配置 sudoers 规则（仅放行安全更新助手与服务控制）..."
 
     cat > "$sudoers_file" << SUDOERS_EOF
-# ${APP_NAME} - 允许 daemon 用户免密执行更新所需的特权命令
+# ${APP_NAME} - 最小权限 sudoers（v0.3.16+）
 # 由安装脚本自动生成，请勿手动修改
 
-# ===== systemd-run 方式（v0.3.10+ 主路径）=====
+# ===== 安全更新助手（远程更新唯一提权入口）=====
 # 服务沙箱 ProtectSystem=strict 使 sudo 提权后的子进程仍处于只读
 # mount namespace，dpkg 直写 /var/lib/dpkg 会报 Read-only file system。
-# systemd-run 在系统 manager 中启动 transient unit，于沙箱外执行安装。
+# systemd-run 在系统 manager 中启动 transient unit，于沙箱外执行助手。
+# 助手自身校验包路径/文件名/SHA-256/包名/包架构后安装，
+# 通配符仅匹配助手之后的参数（包路径与哈希），不可执行任意命令。
 # 注意：参数顺序与 daemon 源码 build_escalated_cmd 逐字对应，勿调整。
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet dpkg -i ${DATA_DIR}/updates/${APP_NAME}_update.deb
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet rpm -U --force ${DATA_DIR}/updates/${APP_NAME}_update.rpm
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet apt-get install -f -y
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet install -m 755 ${DATA_DIR}/updates/extract/usr/bin/${APP_NAME} /usr/bin/${APP_NAME}
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet install -m 755 ${DATA_DIR}/updates/extract/usr/bin/${APP_NAME} /usr/local/bin/${APP_NAME}
+${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemd-run --wait --pipe --quiet /usr/lib/${APP_NAME}/secure-update-helper.sh *
 
-# ===== 直接执行方式（旧版兼容 / 无 systemd 环境回退）=====
-# dpkg 安装更新包
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/dpkg -i /tmp/${APP_NAME}_update.deb
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/dpkg -i /tmp/${APP_NAME}_update.rpm
-# rpm 安装更新包
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/rpm -U --force /tmp/${APP_NAME}_update.rpm
-# install 降级安装更新包（容器/受限环境下 dpkg 数据库只读时，解包直接替换二进制）
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/install -m 755 /tmp/${APP_NAME}_extract/usr/bin/${APP_NAME} /usr/bin/${APP_NAME}
-${APP_USER} ALL=(root) NOPASSWD: /usr/bin/install -m 755 /tmp/${APP_NAME}_extract/usr/bin/${APP_NAME} /usr/local/bin/${APP_NAME}
-# systemctl 服务控制（start/stop/restart/daemon-reload）
+# ===== systemctl 服务控制（start/stop/restart/daemon-reload）=====
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${APP_NAME}
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start ${APP_NAME}.service
@@ -191,7 +314,8 @@ ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${APP_NAME}
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl stop ${APP_NAME}.service
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${APP_NAME}
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${APP_NAME}.service
-# journalctl 查看日志
+
+# ===== journalctl 查看日志 =====
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/journalctl -u ${APP_NAME} *
 ${APP_USER} ALL=(root) NOPASSWD: /usr/bin/journalctl -u ${APP_NAME}.service *
 SUDOERS_EOF
@@ -889,13 +1013,46 @@ uninstall() {
     title "卸载"
     info "开始卸载 $APP_NAME..."
 
+    # 1. 停止所有运行形态：正式 unit、transient unit、nohup 后台进程
     systemctl stop "$APP_NAME" 2>/dev/null || true
+    systemctl stop "${APP_NAME}-run" 2>/dev/null || true
+    pkill -f "$INSTALL_DIR/$APP_NAME" 2>/dev/null || true
     systemctl disable "$APP_NAME" 2>/dev/null || true
 
+    # 2. 优先通过包管理器卸载（保持包数据库一致，便于后续升级/重装）
+    #    手动安装（脚本未走包管理器）或包管理器卸载失败时回退手动清理
+    if command -v dpkg &>/dev/null && dpkg -s "$APP_NAME" &>/dev/null; then
+        if dpkg -r "$APP_NAME" &>/dev/null; then
+            success "已通过 dpkg 卸载软件包"
+        else
+            warn "dpkg 卸载失败，回退手动清理"
+        fi
+    elif command -v rpm &>/dev/null && rpm -q "$APP_NAME" &>/dev/null; then
+        if rpm -e "$APP_NAME" &>/dev/null; then
+            success "已通过 rpm 卸载软件包"
+        else
+            warn "rpm 卸载失败，回退手动清理"
+        fi
+    fi
+
+    # 3. 手动清理二进制与 unit（包管理器已卸载时此步为幂等兜底）
     rm -f "$INSTALL_DIR/$APP_NAME"
+    rm -f "/usr/local/bin/$APP_NAME"
     rm -f "$SERVICE_FILE"
     rm -f "/etc/sudoers.d/${APP_NAME}"
-    rm -rf "$CONFIG_DIR"
+    rm -f "/usr/lib/${APP_NAME}/secure-update-helper.sh"
+    rmdir "/usr/lib/${APP_NAME}" 2>/dev/null || true
+
+    # 4. 配置目录含 proxyToken 等敏感信息，删除前单独确认
+    if [[ -d "$CONFIG_DIR" ]]; then
+        read -p "是否删除配置目录 $CONFIG_DIR（含 proxyToken 等账号信息）？[y/N] " -r < /dev/tty
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            rm -rf "$CONFIG_DIR"
+            success "配置目录已删除"
+        else
+            info "配置目录已保留: $CONFIG_DIR"
+        fi
+    fi
 
     # 仅在非 root 降级模式下清理用户/组
     if [[ "$APP_USER" != "root" ]] && id "$APP_USER" &>/dev/null; then
@@ -905,10 +1062,11 @@ uninstall() {
         groupdel "$APP_GROUP" 2>/dev/null || true
     fi
 
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null || true
 
+    # 5. 数据目录含 device_id，保留可在重装后继续关联原设备
     if [[ -d "$DATA_DIR" ]]; then
-        read -p "是否删除数据目录 $DATA_DIR？[y/N] " -r < /dev/tty
+        read -p "是否删除数据目录 $DATA_DIR（含 device_id，保留可关联原设备）？[y/N] " -r < /dev/tty
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             rm -rf "$DATA_DIR"
             success "数据目录已删除"
@@ -1011,6 +1169,7 @@ main() {
     create_data_dir
     ensure_service_file
     setup_journal_access
+    install_secure_helper
     setup_sudoers
 
     # 安装后自动引导配置
