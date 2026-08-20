@@ -1,6 +1,6 @@
 [package]
 name = "chmlfrp-toolbox-daemon"
-version = "0.3.16"
+version = "0.3.17"
 edition = "2021"
 description = "ChmlFrp 社区工具箱 Daemon - 服务器端远程管理守护进程"
 license = "MIT"
@@ -17,11 +17,19 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# HTTP 客户端（测速用）
-reqwest = { version = "0.12", features = ["stream", "json", "blocking"] }
+# HTTP 客户端（测速用；rustls 纯 Rust TLS，避免依赖系统 OpenSSL，
+# 使产物在 Debian 11（仅 OpenSSL 1.1.1）等老系统上可运行）
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-native-roots",
+    "charset",
+    "http2",
+    "stream",
+    "json",
+    "blocking",
+] }
 futures-util = "0.3"
-# WebSocket
-tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+# WebSocket（同样使用 rustls，证书跟随系统 ca-certificates）
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-native-roots"] }
 # SQLite 数据库
 rusqlite = { version = "0.31", features = ["bundled"] }
 # CLI 参数解析
@@ -79,7 +87,7 @@ summary = "ChmlFrp Community Toolbox Daemon"
 license = "MIT"
 url = "https://github.com/zhengddzz/chmlfrp-toolbox-daemon"
 description = "ChmlFrp 社区工具箱 Daemon - 服务器端远程管理守护进程"
-requires = { openssl-libs = "*", systemd = "*" }
+requires = { systemd = "*" }
 
 assets = [
     { source = "target/release/chmlfrp-toolbox-daemon", dest = "/usr/bin/chmlfrp-toolbox-daemon", mode = "755" },

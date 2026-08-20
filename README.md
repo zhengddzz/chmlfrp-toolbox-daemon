@@ -17,8 +17,9 @@ Daemon 是 ChmlFrp 社区工具箱的服务器端组件，部署在 Linux 服务
 ## 系统要求
 
 - **架构**：x64 (x86_64) 或 ARM64 (aarch64)
-- **系统**：Ubuntu 20.04+ / Debian 11+ / CentOS 8+ / Raspberry Pi OS (Bookworm) / Armbian
-- **不支持**：32 位 ARM (armv7) 设备（如树莓派 3 及更早版本）
+- **系统**：Ubuntu 20.04+ / Debian 11+ / CentOS Stream 9+ / RHEL 9+ / Raspberry Pi OS (Bookworm) / Armbian
+- **glibc**：≥ 2.31（自 v0.3.17 起在 Debian 11 环境构建，TLS 使用 rustls 静态链接，不依赖系统 OpenSSL）
+- **不支持**：32 位 ARM (armv7) 设备（如树莓派 3 及更早版本）；CentOS 7/8、RHEL 8 及更早系统（glibc < 2.31）
 
 ## 安装
 
@@ -57,18 +58,14 @@ sudo dpkg -i chmlfrp-toolbox-daemon_arm64.deb
 sudo apt-get install -f  # 修复依赖
 ```
 
-### 手动安装 rpm 包（CentOS / RHEL / Fedora）
+### 手动安装 rpm 包（CentOS Stream 9+ / RHEL 9+ / Fedora）
 
 ```bash
 # x64
 sudo dnf install -y chmlfrp-toolbox-daemon_x64.rpm
-# 或 CentOS 7
-sudo yum install -y chmlfrp-toolbox-daemon_x64.rpm
 
 # ARM64
 sudo dnf install -y chmlfrp-toolbox-daemon_arm64.rpm
-# 或 CentOS 7
-sudo yum install -y chmlfrp-toolbox-daemon_arm64.rpm
 ```
 
 手动安装后需自行编辑配置文件：

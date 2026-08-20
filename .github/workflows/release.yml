@@ -15,44 +15,61 @@ jobs:
     strategy:
       matrix:
         include:
-          - platform: ubuntu-22.04
+          - platform: debian-11-x64
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             arch: x64
             deb_suffix: amd64
-            rpm_arch: x86_64
-          - platform: ubuntu-22.04-arm
+          - platform: debian-11-arm64
             runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             arch: arm64
             deb_suffix: arm64
-            rpm_arch: aarch64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Restore Rust cache
+        uses: actions/cache@v4
         with:
-          targets: ${{ matrix.target }}
+          path: |
+            .cargo-home
+            target
+          key: rust-debian11-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rust-debian11-${{ matrix.arch }}-
 
-      - name: Install cargo-deb and cargo-generate-rpm
+      # 在 Debian 11 容器内构建：产物仅依赖 glibc >= 2.31（Debian 11 自带版本），
+      # 同时 TLS 使用 rustls 静态链接进二进制，不依赖系统 OpenSSL，
+      # 因此 Debian 11（OpenSSL 1.1.1）与 Debian 12+/Ubuntu 22.04+（OpenSSL 3.x）均可运行
+      - name: Build and test in Debian 11 container
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          DEB_SUFFIX: ${{ matrix.deb_suffix }}
         run: |
-          cargo install cargo-deb
-          cargo install cargo-generate-rpm
+          docker run --rm -v "$PWD:/build" -w /build \
+            -e CARGO_HOME=/build/.cargo-home \
+            -e TARGET -e ARCH -e DEB_SUFFIX \
+            debian:11 bash -euxo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends build-essential pkg-config curl ca-certificates
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+              . "$CARGO_HOME/env"
 
-      - name: Run tests
-        run: cargo test --locked
+              cargo test --locked
+              cargo build --locked --release --target "$TARGET"
 
-      - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+              command -v cargo-deb >/dev/null 2>&1 || cargo install --locked cargo-deb
+              command -v cargo-generate-rpm >/dev/null 2>&1 || cargo install --locked cargo-generate-rpm
+              cargo deb --target "$TARGET" --output "chmlfrp-toolbox-daemon_${DEB_SUFFIX}.deb"
+              cargo generate-rpm --target "$TARGET" --output "chmlfrp-toolbox-daemon_${ARCH}.rpm"
 
-      - name: Build deb package
-        run: cargo deb --target ${{ matrix.target }} --output chmlfrp-toolbox-daemon_${{ matrix.deb_suffix }}.deb
-
-      - name: Build rpm package
-        run: cargo generate-rpm --target ${{ matrix.target }} --output chmlfrp-toolbox-daemon_${{ matrix.arch }}.rpm
+              # 容器以 root 写入的缓存目录放开权限，避免宿主 runner 用户无法读取缓存
+              chmod -R ugo+rwX /build/target /build/.cargo-home 2>/dev/null || true
+            '
 
       - name: Upload deb artifact
         uses: actions/upload-artifact@v4
@@ -92,20 +109,11 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## v0.3.16 更新汇总
+            ## v0.3.17 更新汇总
 
-            ### 适配与稳定性
-            - **清理幂等**：重复下发清理请求不再报错——已有清理在进行时等待其完成，资源已释放时直接返回成功，与桌面客户端强制停止流程更好适配。
-            - **更新互斥**：自动更新与手动更新同时触发时直接拒绝后者，避免重复下载与包管理器锁争抢。
-            - **严格包匹配**：更新只安装与当前架构（x64/arm64）和包格式（deb/rpm）严格匹配的安装包，拒绝跨架构、跨发行版回退安装。
-
-            ### 安全改进
-            - **安全更新助手**：新增 root 管理的固定提权入口，sudoers 收紧为仅放行该助手与服务控制命令，修复"数据目录可写 + sudoers 放行 dpkg/rpm"的提权风险。助手校验包路径、文件名、SHA-256、包名与包架构，并复制到 root 暂存区防止校验后被替换（TOCTOU）。
-
-            ### 安装脚本优化
-            - **升级保留数据**：安装与升级过程保留 config.toml、device_id 与数据目录。
-            - **双系发行版**：正确区分 apt/dnf/yum，不再对 dnf/yum 环境使用 deb 包降级安装。
-            - **服务启动验证**：systemd 环境严格验证服务启动（运行中用 restart 确保新二进制生效），非 systemd 环境显式后台运行；卸载时停止正式单元、临时单元与后台进程，配置与数据目录删除前单独询问。
+            ### 兼容性
+            - **Debian 11 支持**：二进制改在 Debian 11 环境中构建，最低 glibc 要求降至 2.31，新增兼容 Debian 11、Ubuntu 20.04 等较旧系统（Debian 12/13、Ubuntu 22.04+ 保持兼容）。
+            - **摆脱 OpenSSL 依赖**：TLS 全部切换为 rustls 并静态编译进二进制，不再依赖系统 libssl，旧系统（OpenSSL 1.1.1）与新系统（OpenSSL 3.x）均可直接运行；证书校验跟随系统 ca-certificates 更新。
 
           files: |
             release/*.deb
