@@ -626,6 +626,54 @@ async fn create_temp_tunnel(
     ))
 }
 
+/// 解析隧道列表中的 id（兼容数字与字符串两种返回）
+fn parse_tunnel_id(value: Option<&serde_json::Value>) -> Option<i64> {
+    match value? {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .or_else(|| number.as_f64().map(|value| value.trunc() as i64)),
+        serde_json::Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+/// ChmlFrp 对已删除或不属于当前账号的隧道会返回「不属于你/隧道不存在」。
+/// 删除是幂等操作，该返回不应被当成清理失败（与桌面端 tunnelCleanupRules 保持一致）。
+fn is_tunnel_already_gone(message: &str) -> bool {
+    message.contains("不属于你") || message.contains("隧道不存在")
+}
+
+/// 查询账号下是否仍存在指定隧道。
+/// 返回 None 表示查询失败，不推定结果，避免掩盖真实清理失败。
+async fn tunnel_exists(access_token: &str, tunnel_id: i64) -> Option<bool> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?;
+
+    let resp = client
+        .get("https://cf-v2.uapis.cn/tunnel")
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let tunnels = data
+        .get("data")
+        .or(Some(&data))
+        .and_then(|value| value.as_array())?;
+    Some(
+        tunnels
+            .iter()
+            .any(|tunnel| parse_tunnel_id(tunnel.get("id")) == Some(tunnel_id)),
+    )
+}
+
 /// 删除隧道（chmlfrp API 只认 accessToken，先用 proxy_token 换取）
 async fn delete_tunnel(backend_url: &str, proxy_token: &str, tunnel_id: i64) -> Result<(), String> {
     let access_token = super::auth::ensure_access_token(backend_url, proxy_token)
@@ -659,6 +707,27 @@ async fn delete_tunnel(backend_url: &str, proxy_token: &str, tunnel_id: i64) -> 
             .get("msg")
             .and_then(|v| v.as_str())
             .unwrap_or("未知错误");
+
+        // 删除是幂等操作：先确认隧道是否真的还在，已不存在则按清理成功处理，
+        // 避免测速成功后误报「删除隧道失败」。
+        match tunnel_exists(&access_token, tunnel_id).await {
+            Some(false) => {
+                warn!(
+                    "[e2e] 隧道 {} 已不存在（{}），按清理成功处理",
+                    tunnel_id, msg
+                );
+                return Ok(());
+            }
+            None if is_tunnel_already_gone(msg) => {
+                warn!(
+                    "[e2e] 删除隧道返回「{}」且无法确认隧道状态，按已清理处理",
+                    msg
+                );
+                return Ok(());
+            }
+            _ => {}
+        }
+
         warn!("[e2e] 删除隧道失败: {}", msg);
         return Err(format!("删除隧道失败: {}", msg));
     }
@@ -1118,7 +1187,23 @@ pub async fn handle_cleanup(
 
 #[cfg(test)]
 mod tests {
-    use super::ResourceCoordinator;
+    use super::{is_tunnel_already_gone, parse_tunnel_id, ResourceCoordinator};
+
+    #[test]
+    fn detects_tunnel_already_gone_message() {
+        // ChmlFrp 对已删除隧道的返回，删除应视为幂等成功
+        assert!(is_tunnel_already_gone("此隧道不属于你，或隧道不存在"));
+        assert!(is_tunnel_already_gone("隧道不存在"));
+        assert!(!is_tunnel_already_gone("网络连接失败"));
+    }
+
+    #[test]
+    fn parses_tunnel_id_from_number_and_string() {
+        assert_eq!(parse_tunnel_id(Some(&serde_json::json!(12))), Some(12));
+        assert_eq!(parse_tunnel_id(Some(&serde_json::json!("12"))), Some(12));
+        assert_eq!(parse_tunnel_id(Some(&serde_json::json!(" abc "))), None);
+        assert_eq!(parse_tunnel_id(None), None);
+    }
 
     #[test]
     fn cleanup_is_single_owner_operation() {
