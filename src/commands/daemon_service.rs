@@ -132,7 +132,7 @@ pub async fn service_control(params: &serde_json::Value, _ctx: &CommandContext) 
 }
 
 /// 获取服务状态（扁平结构，前端可直接解析）
-fn get_service_status() -> serde_json::Value {
+pub fn get_service_status() -> serde_json::Value {
     let active_state = std::process::Command::new("systemctl")
         .args(&["is-active", APP_NAME])
         .output()

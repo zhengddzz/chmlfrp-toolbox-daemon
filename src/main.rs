@@ -80,8 +80,10 @@ async fn main() -> anyhow::Result<()> {
             info!("配置文件: {}", cli.config.display());
             info!("后端地址: {}", cfg.server.backend_url);
             info!("配置账号数: {}", cfg.accounts.len());
-            // TODO: 通过本地 socket 查询运行状态
-            println!("Daemon 状态查询功能待实现（需通过本地管理 socket）");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&commands::daemon_service::get_service_status())?
+            );
         }
         Command::InitConfig { output } => {
             let _log_guard = logs::init_tracing(None);

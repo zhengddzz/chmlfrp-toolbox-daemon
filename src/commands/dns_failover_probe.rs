@@ -43,6 +43,41 @@ fn parse_params(params: &serde_json::Value) -> Result<ProbeParams, super::RpcErr
             "executionId 不能为空",
         ));
     }
+    if parsed.methods.is_empty() || parsed.methods.len() > 4 {
+        return Err(super::RpcError::new(
+            "INVALID_PARAMS",
+            "methods 数量必须在 1 到 4 之间",
+        ));
+    }
+    if parsed
+        .methods
+        .iter()
+        .any(|method| !matches!(method.as_str(), "tunnel_state" | "node_state" | "tcping"))
+    {
+        return Err(super::RpcError::new("INVALID_PARAMS", "包含不支持的探测方法"));
+    }
+    if !(100..=120_000).contains(&parsed.timeout_ms) {
+        return Err(super::RpcError::new(
+            "INVALID_PARAMS",
+            "timeoutMs 必须在 100 到 120000 之间",
+        ));
+    }
+    if parsed.tunnels.len() > 100 {
+        return Err(super::RpcError::new("INVALID_PARAMS", "tunnels 数量不能超过 100"));
+    }
+    let mut tunnel_ids = std::collections::HashSet::new();
+    for tunnel in &parsed.tunnels {
+        if tunnel.id.trim().is_empty()
+            || tunnel.node_host.trim().is_empty()
+            || tunnel.node_port == 0
+            || !tunnel_ids.insert(tunnel.id.as_str())
+        {
+            return Err(super::RpcError::new(
+                "INVALID_PARAMS",
+                "tunnels 包含无效或重复的隧道信息",
+            ));
+        }
+    }
     Ok(parsed)
 }
 
@@ -124,6 +159,72 @@ mod tests {
             "tunnels": []
         });
         assert!(parse_params(&params).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_probe_parameters() {
+        let cases = [
+            serde_json::json!({
+                "executionId": "run-1",
+                "methods": [],
+                "tunnels": []
+            }),
+            serde_json::json!({
+                "executionId": "run-1",
+                "methods": ["unknown"],
+                "tunnels": []
+            }),
+            serde_json::json!({
+                "executionId": "run-1",
+                "methods": ["tcping"],
+                "timeoutMs": 99,
+                "tunnels": []
+            }),
+        ];
+
+        for params in cases {
+            assert!(parse_params(&params).is_err(), "参数应被拒绝: {params}");
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_tunnels() {
+        let invalid_tunnels = [
+            serde_json::json!({
+                "id": "",
+                "nodeHost": "127.0.0.1",
+                "nodePort": 80
+            }),
+            serde_json::json!({
+                "id": "tunnel-1",
+                "nodeHost": "",
+                "nodePort": 80
+            }),
+            serde_json::json!({
+                "id": "tunnel-1",
+                "nodeHost": "127.0.0.1",
+                "nodePort": 0
+            }),
+        ];
+
+        for tunnel in invalid_tunnels {
+            let params = serde_json::json!({
+                "executionId": "run-1",
+                "methods": ["tcping"],
+                "tunnels": [tunnel]
+            });
+            assert!(parse_params(&params).is_err(), "隧道参数应被拒绝: {params}");
+        }
+
+        let duplicate_params = serde_json::json!({
+            "executionId": "run-1",
+            "methods": ["tcping"],
+            "tunnels": [
+                { "id": "tunnel-1", "nodeHost": "127.0.0.1", "nodePort": 80 },
+                { "id": "tunnel-1", "nodeHost": "127.0.0.1", "nodePort": 81 }
+            ]
+        });
+        assert!(parse_params(&duplicate_params).is_err());
     }
 
     #[test]

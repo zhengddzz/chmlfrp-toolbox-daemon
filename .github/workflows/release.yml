@@ -109,11 +109,13 @@ jobs:
         with:
           name: ChmlFrp 社区工具箱 Daemon ${{ github.ref_name }}
           body: |
-            ## v0.3.17 更新汇总
+            ## v0.3.18 更新汇总
 
-            ### 兼容性
-            - **Debian 11 支持**：二进制改在 Debian 11 环境中构建，最低 glibc 要求降至 2.31，新增兼容 Debian 11、Ubuntu 20.04 等较旧系统（Debian 12/13、Ubuntu 22.04+ 保持兼容）。
-            - **摆脱 OpenSSL 依赖**：TLS 全部切换为 rustls 并静态编译进二进制，不再依赖系统 libssl，旧系统（OpenSSL 1.1.1）与新系统（OpenSSL 3.x）均可直接运行；证书校验跟随系统 ca-certificates 更新。
+            ### 新增功能
+            - **状态查询可用**：`daemon status` 不再提示功能待实现，直接输出服务运行状态（JSON 格式），脚本和面板都能直接读取。
+
+            ### 稳定性与安全
+            - **DNS 容灾探测校验**：限制探测方法数量与类型、超时范围和隧道数量，并拒绝空 ID、空节点地址、0 端口和重复隧道；异常请求会直接返回错误，避免无效任务占用资源。
 
           files: |
             release/*.deb
