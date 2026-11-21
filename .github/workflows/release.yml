@@ -54,6 +54,11 @@ jobs:
             -e TARGET -e ARCH -e DEB_SUFFIX \
             debian:11 bash -euxo pipefail -c '
               export DEBIAN_FRONTEND=noninteractive
+              # Debian 11 已停止常规支持，镜像内置的 deb.debian.org 安全源会 404；
+              # 改用归档源并关闭 Valid-Until 校验，保留 glibc 2.31 构建环境
+              printf "%s\n" "deb http://archive.debian.org/debian bullseye main" "deb http://archive.debian.org/debian-security bullseye-security main" > /etc/apt/sources.list
+              rm -f /etc/apt/sources.list.d/debian.sources
+              printf "%s\n" "Acquire::Check-Valid-Until \"false\";" > /etc/apt/apt.conf.d/99archive
               apt-get update -qq
               apt-get install -y -qq --no-install-recommends build-essential pkg-config curl ca-certificates
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
